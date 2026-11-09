@@ -69,9 +69,85 @@ For training the multi-classification, we used accuracy because we care equally 
 
 For training the scoring, we evaluated with RSME. It represents how accurate the model is at scoring by taking the root of the sum of squared errors. 
 
-## Front End
-A streamlit front end is made to demo our project details. We make sure to add coloring effect to the front end design such that we are also capable of making 
+The trained checkpoint now ships in `models/saved_bert_model/` and is wired into the app as a fourth
+analysis column. It loads **entirely from local files** — `config.json`, `head_config.json`,
+`tokenizer.json` and `model.safetensors` — with `local_files_only=True`, so it never touches the
+HuggingFace Hub or the network. Its contract:
 
+- **8 topics**, in the data-derived order `customer service, design, function, other, overall,
+  price, quality, security` (`sorted(df['topic'].unique())` over the training corpus). This is
+  *not* the 6-label vocabulary the split prompt uses — the splitter keeps 6 labels, the BERT head
+  has 8.
+- **Sentiment is a regression score in [-1, 1]**, regressing the LLM's per-sub-comment
+  `sentiment` float, *not* the review `score` column (1–5). Raw head outputs overshoot the range
+  on ~18% of the corpus, so they are clamped to [-1, 1] and the unclamped value is kept as
+  `sentiment_raw`.
+
+## Front End
+
+A Streamlit front end is made to demo our project details. We make sure to add coloring effect to
+the front end design such that we are also capable of making
+
+```bash
+streamlit run app.py
+```
+
+### Input modes
+
+| Mode | What it does |
+|---|---|
+| **Manual Review Input** | Analyzes one typed review synchronously in **four** comparison columns — Naive Bayes, Logistic Regression, RAKE, and BERT Multi-Task. |
+| **Google Play Store App URL** | Fetches the newest English/US reviews for an app and submits them to the async review service, one job per batch. |
+| **CSV Upload** | Uploads raw reviews and submits them the same way. |
+
+### The four columns
+
+- **Naive Bayes** and **Logistic Regression** show a review-level `Positive` / `Negative`
+  percentage and colour the sentence word by word. Word-level colouring needs the word2vec binary
+  (gitignored, ~700 MB — see the setup below); without it the columns still show the review-level
+  scores.
+- **RAKE** lists the review's top keyword phrases. It needs no model and no word2vec.
+- **BERT Multi-Task** splits the review into sub-comments with the configured LLM provider, labels
+  each one with a topic and a sentiment, and shows the per-sub-comment table plus a rollup
+  (dominant topic by mean confidence, mean sentiment). The sentiment is a **regression score in
+  [-1, 1]**, not a percentage. Without a provider key the app still runs and labels the whole
+  review as a single sub-comment, with a visible warning.
+
+### Batch controls (URL and CSV modes)
+
+| Control | Default | Range |
+|---|---|---|
+| Number of batches | 1 | 1–10 |
+| Reviews per batch | 100 | 100–1,000 |
+
+A run is capped at 10 batches / 10,000 reviews. The app shows the available rows, the selected
+rows, the jobs it will create and the estimated number of LLM split requests (about one per
+selected review) before anything is submitted; if the source has more rows than the selection
+covers, you must confirm how many rows will be left unprocessed.
+
+### CSV upload format
+
+The `content` column is **required**; any other columns (for example `score` and `date`) are
+preserved in the result. Uploads are limited to 50 MiB.
+
+```csv
+content,score,date
+"The app is useful, but the subscription is too expensive.",2,2025-01-15
+```
+
+A CSV without a `content` column, an empty file, or a file over the size limit is rejected with an
+actionable message.
+
+### Results
+
+Submitted batches are polled for status and show per-batch and overall progress. When the batches
+finish, the app combines their result CSVs in `source_row_index` order and renders a table of
+`source_row_index`, `content`, `sub_comment`, `bert_topic`, `bert_topic_conf`, `bert_sentiment`
+and `split_fallback` (preview capped at 1,000 rows, with the full row count shown). The complete
+combined annotated CSV is available for download.
+
+Batch mode talks to the review service described in `.claude/plans/aws-deployment.md`; point the
+app at it with `REVIEW_SERVICE_URL` (default `http://localhost:8000`) and `API_TOKEN`.
 
 ## install dependencies
 
@@ -92,3 +168,27 @@ To check the quality of the processed data, run the following command:
 ```bash
 python scripts/check_label_quality.py
 ```
+
+## Local BERT inference
+
+`models/bert_inference.py` loads the checkpoint from disk with no Hub and no network, and
+`scripts/bert_inference.py` annotates the whole corpus and writes an agreement report:
+
+```bash
+python scripts/bert_inference.py --batch-size 64
+```
+
+This writes `data/processed/bert_sub_comments.csv` (one row per sub-comment) and
+`data/processed/bert_agreement_report.txt`. The report measures **agreement with the annotator
+that produced the corpus labels**, on the corpus the model was trained on — it is optimistic by
+construction and is not accuracy against human ground truth.
+
+## Setup notes
+
+- `OPENROUTER_API_KEY` (or `GEMINI_API_KEY`) in `.env` is needed for the LLM split. The app starts
+  without it and falls back to whole-review BERT.
+- `models/saved_bert_model/model.safetensors` is **not** in git — it is 438 MB, over GitHub's
+  100 MB per-file limit. The rest of the checkpoint directory is tracked; copy the weights in
+  separately.
+- `models/trained_model/GoogleNews-vectors-negative300.bin.gz` is gitignored and must be
+  downloaded by hand (figshare link in `models/scoring.py`).

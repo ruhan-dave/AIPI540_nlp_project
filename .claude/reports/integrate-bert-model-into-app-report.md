@@ -2,6 +2,8 @@
 
 **Plan**: `.claude/plans/integrate-bert-model-into-app.md`
 **Branch**: `feature/integrate-bert-model-into-app`
+**Commit**: `1def4af` — *feat: wire the saved BERT checkpoint into the app as a fourth analysis column*
+**Pull request**: https://github.com/ruhan-dave/AIPI540_nlp_project/pull/1 (base `main` ← head `feature/integrate-bert-model-into-app`)
 **Status**: COMPLETE (one validation blocked by a credential — see *Issues encountered*)
 
 ## Summary

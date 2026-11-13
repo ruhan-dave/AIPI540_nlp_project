@@ -18,3 +18,15 @@ models/saved_bert_model/model.safetensors
 data/processed/processed_reviews.csv
 data/processed/bert_sub_comments.csv
 data/processed/processing_temp.csv
+
+# Terraform — generated state, saved plans, real variable files and the real
+# backend configuration never belong in Git. The .example files are tracked.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+backend.hcl
+
+# Test artefacts
+.pytest_cache/

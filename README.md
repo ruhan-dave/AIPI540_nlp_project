@@ -206,3 +206,173 @@ construction and is not accuracy against human ground truth.
   to the Railway frontend's persistent Volume using `railway volume files upload`; it is not in the AWS
   API/worker image or AWS job-data S3 bucket. Keep a local backup because Railway Volume-only storage has no
   separate remote recovery copy.
+
+## Deployment
+
+The demo runs as two pieces: **AWS hosts the API and the worker**, **Railway hosts the Streamlit
+frontend**. The frontend never loads BERT — in the hosted environment it calls the AWS API over
+HTTPS. AWS resources are provisioned with Terraform; the Railway service and its Volume are set up
+by hand (or with the Railway CLI).
+
+```
+Railway (Streamlit)  ──HTTPS + bearer token──▶  ALB  ──▶  ECS/Fargate API  ──▶  SQS
+                                                                                    │
+                                                                            ECS/Fargate worker
+                                                                                    │
+                                                            S3 (job input/result) ◀──┘
+```
+
+### The API
+
+| Route | Auth | What it does |
+|---|---|---|
+| `GET /healthz` | none | `503 {"status":"loading"}` until the local checkpoint loads, then `200 {"status":"ready"}`. |
+| `POST /predict` | bearer | One review in, split and labelled sub-comments out. |
+| `POST /jobs` | bearer | One CSV upload (≤ 50 MiB, ≤ 1,000 reviews, a `content` column) becomes one job. |
+| `GET /jobs/{job_id}` | bearer | Status plus `completed_reviews` and `total_reviews`. |
+| `GET /jobs/{job_id}/result` | bearer | A short-lived presigned URL, only after the job completes. |
+
+Every route except `/healthz` needs `Authorization: Bearer $API_TOKEN`. `429` means the client is over
+its rate limit; `503` means the model is not ready or the service is saturated.
+
+### Terraform
+
+Two roots: `infra/bootstrap` creates the remote-state bucket, `infra/terraform` creates the
+application stack. The bootstrap root starts with local state because the bucket does not exist yet.
+
+```bash
+# 1. bootstrap the state bucket (plan, review, then apply — applying needs approval)
+terraform -chdir=infra/bootstrap fmt -check -recursive
+terraform -chdir=infra/bootstrap init
+terraform -chdir=infra/bootstrap validate
+terraform -chdir=infra/bootstrap plan -out=state-bucket.tfplan
+terraform -chdir=infra/bootstrap show -no-color state-bucket.tfplan
+terraform -chdir=infra/bootstrap apply state-bucket.tfplan
+
+# 2. copy the backend configs and migrate the state
+cp infra/bootstrap/backend.hcl.example infra/bootstrap/backend.hcl   # then fill it in
+cp infra/terraform/backend.hcl.example infra/terraform/backend.hcl     # then fill it in
+# uncomment the backend block in infra/bootstrap/backend.tf
+terraform -chdir=infra/bootstrap init -migrate-state -backend-config=backend.hcl
+
+# 3. the application stack
+terraform -chdir=infra/terraform init -backend-config=backend.hcl
+terraform -chdir=infra/terraform validate
+terraform -chdir=infra/terraform plan -var='desired_count=0' -out=bootstrap.tfplan
+terraform -chdir=infra/terraform show -no-color bootstrap.tfplan
+```
+
+`terraform.tfvars` is gitignored; `terraform.tfvars.example` is tracked and holds only non-secret
+settings. **Never put `API_TOKEN` or `OPENROUTER_API_KEY` in a `.tfvars` file, in the backend
+configuration, or in a Terraform variable** — they live in Secrets Manager and in Railway's sealed
+variables.
+
+The stack needs an **existing VPC** with at least two public subnets in different Availability
+Zones, a **public DNS name** for the API, and an **ACM certificate** for that name in the same
+region. Point the domain at the load balancer's DNS name (`terraform output -raw alb_dns_name`).
+If the domain or the certificate is not available, **do not** fall back to plain HTTP — the bearer
+token would cross the internet in the clear.
+
+### Applying, in two stages
+
+1. Apply with `desired_count=0`. This creates everything and starts no tasks — ECS must not try to
+   pull an image that does not exist yet.
+2. Seed the two Secrets Manager secrets with their values, out of band (the AWS console or a
+   secret-delivery pipeline). Terraform manages only the secrets' metadata and ARNs.
+3. Build and push the image:
+
+   ```bash
+   AWS_REGION=$(terraform -chdir=infra/terraform output -raw aws_region)
+   API_ECR_URL=$(terraform -chdir=infra/terraform output -raw api_ecr_repository_url)
+   export IMAGE_TAG=v1   # the same value as `image_tag` in terraform.tfvars
+   aws ecr get-login-password --region "$AWS_REGION" \
+     | docker login --username AWS --password-stdin "${API_ECR_URL%%/*}"
+   docker build --platform linux/amd64 -f Dockerfile -t "$API_ECR_URL:$IMAGE_TAG" .
+   docker push "$API_ECR_URL:$IMAGE_TAG"
+   ```
+
+   `--platform linux/amd64` matters: Fargate runs x86-64, and an image built on an Apple Silicon
+   machine is arm64.
+4. Apply again with `desired_count=1` to start the API and the worker.
+
+### The worker
+
+The worker reads the input CSV in 25-review chunks, calls the LLM splitter once per review, labels
+the resulting sub-comments with BERT in batches of 64, and commits each chunk to S3 before
+recording the progress. A job that dies resumes from the last committed chunk instead of repeating
+the LLM calls it already paid for. The SQS visibility timeout (600 s) and the DynamoDB lease are
+renewed every 60 seconds, because one job takes far longer than the visibility timeout: roughly
+17–50 minutes for a full 1,000-review job. A job that fails three times lands in the dead-letter
+queue and its record is marked `FAILED`.
+
+### Railway (the frontend)
+
+The frontend image is `Dockerfile.frontend`. It installs Streamlit, pandas, PyArrow,
+scikit-learn and Gensim — **not** Torch or Transformers, because the hosted frontend calls the
+remote API instead of loading BERT.
+
+Railway variables:
+
+| Variable | Value |
+|---|---|
+| `BERT_INFERENCE_MODE` | `remote` |
+| `REVIEW_SERVICE_URL` | `https://<your API domain>` |
+| `API_TOKEN` | the same token that is in the AWS secret — server-side only |
+
+The start command is `streamlit run app.py --server.address 0.0.0.0 --server.port $PORT`; Railway
+supplies `$PORT` and the public domain.
+
+The GoogleNews word2vec binary is **not** in the image. Attach a Railway Volume at
+`/app/models/trained_model` and seed it once:
+
+```bash
+railway volume add --service <service-id> --mount-path /app/models/trained_model \
+  --project <project-id> --environment <environment-id> --json
+railway volume files upload models/trained_model/GoogleNews-vectors-negative300.bin.gz \
+  /GoogleNews-vectors-negative300.bin.gz --project <project-id> \
+  --environment <environment-id> --service <service-id> --json
+```
+
+Seed the volume **before** the first Streamlit run: if `load_word2vec()` runs while the file is
+missing, the process caches "not available" and needs a restart. The file is about 1.53 GB
+compressed and expands to about 3.64 GB in memory, so budget at least 8 GiB per replica and keep
+one replica until the volume's behaviour across replicas has been verified.
+
+### Cost and access
+
+- The AWS API and the worker each run 1 vCPU / 2 GiB on Fargate, plus the ALB, SQS, DynamoDB and
+  S3. Railway charges for the frontend and its Volume separately. Recalculate both before
+  deploying, and **do not leave either environment running after the demo**.
+- **The frontend is public by default.** A server-side `API_TOKEN` protects the API, but it does
+  not stop a visitor from spending your LLM credits by triggering jobs through the UI. Restrict
+  access with application authentication or Railway's access controls.
+
+### Teardown
+
+`terraform destroy` removes only what is in the selected state — not Railway, not externally
+managed DNS or certificates, not shared networking. Use the same account, region, workspace,
+`.tfvars` and backend configuration that were used to deploy, and never use `-auto-approve`,
+`terraform state rm` or a broad account-wide delete.
+
+The full checklist — freezing the demo, emptying the job-data bucket, destroying the application
+stack, removing the state bucket last, and tearing Railway down separately — is in
+`.claude/references/deployment.md`.
+
+### Local proof of concept
+
+```bash
+docker build -t reviewassist-api:local -f Dockerfile .
+docker run --rm -p 8000:8000 \
+  -e AWS_REGION=us-east-1 -e JOB_BUCKET=demo \
+  -e QUEUE_URL=https://sqs.us-east-1.amazonaws.com/1/demo -e JOBS_TABLE=demo \
+  -e API_TOKEN=dev-token reviewassist-api:local
+curl -s localhost:8000/healthz
+```
+
+The service tests run against moto's in-memory S3, SQS and DynamoDB:
+
+```bash
+uv pip install -r requirements-dev.txt
+uv run pytest tests/ -q
+```
+

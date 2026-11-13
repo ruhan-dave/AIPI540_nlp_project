@@ -36,6 +36,19 @@ AIPI540_nlp_project/
   data/processed/          # processed_data.csv → processed_reviews.csv (see the chain below)
   app.py                   # Streamlit UI: four columns — NB | LR | RAKE | BERT
   main.py                  # entry point; shells out to `streamlit run app.py`
+  service/                 # the deployed backend — FastAPI API + SQS worker (one image, two commands)
+    settings.py            # every runtime knob, read from the environment; frozen
+    schemas.py             # the HTTP wire formats (predict, jobs, status, result)
+    inference.py           # ModelRuntime (the local BERT checkpoint) + Splitter (the LLM split)
+    batch_io.py            # CSV validation, chunking, result assembly, the S3 object helpers
+    jobs.py                # the DynamoDB job store (status, lease, claims) + the SQS queue
+    server.py              # FastAPI: /healthz, /predict, /jobs
+    worker.py              # the SQS worker: chunk checkpoints, 60 s heartbeats, DLQ behaviour
+  Dockerfile               # the backend image: CPU-only torch, the checkpoint baked in
+  Dockerfile.frontend      # the Railway frontend image: Streamlit, no torch
+  infra/bootstrap/         # Terraform: the remote-state bucket (one-time)
+  infra/terraform/         # Terraform: ECR, ECS/Fargate, ALB, SQS, DynamoDB, S3, secrets, IAM
+  tests/                   # the service tests — moto-backed S3/SQS/DynamoDB
   .claude/                 # AI layer: 37 skills, 6 agents, 8 hooks, 8 reference docs (untracked)
 ```
 
@@ -103,8 +116,25 @@ needs, which `processed_data.csv` does not.
 - **The pipeline checkpoints; don't delete the checkpoint.** `preprocess_data.py:20` writes
   `data/processed/processing_temp.csv` every 5 records and resumes from it, removing it only on success
   (`:116-118`). That file is what makes a 20-thread LLM pass over 16k reviews survivable.
-- **There is no test suite.** "Done" for a model change means re-running the training script and reading the
-  printed `classification_report` (`scripts/model.py:58,67`) and metric dict (`scripts/eval_model.py`).
+- **There is no test suite for the modelling pipeline.** "Done" for a model change means re-running the training
+  script and reading the printed `classification_report` (`scripts/model.py:58,67`) and metric dict
+  (`scripts/eval_model.py`). The **deployed service** does have one: `tests/` covers the CSV contract, the job
+  lifecycle and the worker against moto's S3/SQS/DynamoDB. Run it with `pytest tests/`.
+- **The service never logs review text, bearer tokens or provider keys.** `service/inference.py` and
+  `service/worker.py` log identifiers (`job_id`, chunk index, progress) and error *types*, never the payload.
+- **The SQS message carries a pointer, never a payload.** `service/jobs.py:JobQueue.send` puts only
+  `{job_id, input_key, options}` on the queue; the review text stays in the private S3 bucket.
+- **The backend image must keep `models/saved_bert_model/`** — `.dockerignore` deliberately does not exclude it.
+  `model.safetensors` is gitignored but must ship in the image, and the image sets `HF_HUB_OFFLINE=1` /
+  `TRANSFORMERS_OFFLINE=1` with an empty `HF_HOME`, so a cold start can never reach the network.
+- **The frontend image must not grow Torch.** `Dockerfile.frontend` installs only the frontend dependencies; the
+  hosted frontend calls the AWS API (`BERT_INFERENCE_MODE=remote`). The word2vec binary lives on the Railway
+  Volume at `/app/models/trained_model`, not in any image.
+- **Terraform never carries a secret value.** `API_TOKEN` and the provider key live in Secrets Manager (metadata
+  and ARNs only, seeded out of band) and in Railway's sealed variables. `sensitive = true` redacts CLI output; it
+  does **not** remove a value from state. Never pass either as a Terraform variable.
+- **Applying infrastructure needs explicit human approval.** `terraform apply` and `terraform destroy` are
+  execution steps, not planning steps — plan, show the plan, and wait.
 
 ## Working principles (agent steering)
 
@@ -133,6 +163,12 @@ Run everything from the repo root.
 | `python scripts/eval_model.py` | Topic precision/recall/F1 + sentiment MSE |
 | `python scripts/bert_inference.py --batch-size 64` | Annotate the corpus with the local BERT checkpoint + write the agreement report |
 | `streamlit run app.py` | The demo UI (equivalent: `python main.py`) |
+| `pip install -r requirements-dev.txt` | Install the service test dependencies (pytest, moto, fastapi, boto3) |
+| `pytest tests/ -q` | Run the service tests against moto's S3/SQS/DynamoDB |
+| `docker build -t reviewassist-api:local -f Dockerfile .` | Build the backend image (CPU-only torch, checkpoint baked in) |
+| `python -m service.server` | Run the API locally (needs `API_TOKEN`, `JOB_BUCKET`, `QUEUE_URL`, `JOBS_TABLE`) |
+| `python -m service.worker` | Run the SQS worker locally (same environment variables) |
+| `terraform -chdir=infra/terraform plan` | Plan the AWS stack — **review the plan; applying needs approval** |
 
 **Setup:** `OPENROUTER_API_KEY` (or `GEMINI_API_KEY`) in `.env` (gitignored) — required by `scripts/llm_api.py` for
 the *active* provider (`LLM_PROVIDER`, default `openrouter`); `llm_api.py` raises at import without it, so
@@ -175,11 +211,18 @@ Live, verified breakages. Full inventory with fixes: `.claude/references/known-i
 - **New preprocessing step** → `scripts/build_features.py`, keeping `clear_content` in sync across all copies.
 - **New UI panel** → the four-column layout in `app.py`; the scoring helpers live in `models/scoring.py`
   (not `models/machine_learning.py` — that module executes a training pipeline at import time).
+- **New API route or job behaviour** → `service/server.py` (routes) + `service/schemas.py` (the wire format);
+  the persistence rules live in `service/jobs.py` and the CSV rules in `service/batch_io.py`. Add a case to
+  `tests/` alongside it — the service is the one part of the repo with a test suite.
+- **New AWS resource** → `infra/terraform/main.tf`, then `terraform -chdir=infra/terraform validate` and a
+  reviewed plan. Never add a secret value; use the Secrets Manager secret the stack already manages.
 
 ## On-demand context
 
 - `.claude/references/data-pipeline.md` — pipeline stages, the `sub_comments` contract, resuming, data flow.
 - `.claude/references/models.md` — the model families, how to retrain and score each, and the BERT
   multi-task architecture + inference contract.
+- `.claude/references/deployment.md` — the AWS resource set, the HTTPS API boundary, the Railway setup,
+  the worker's properties, and the separate teardown checklists.
 - `.claude/references/{conventions,engineering,direction}.md` — **stale course templates.** They describe a
   different project ("AI Tutor") and are not yet rewritten for this repo. Don't treat them as truth here.

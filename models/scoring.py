@@ -44,10 +44,10 @@ _WORD2VEC_LOADED = False
 def load_word2vec(model_path: str | pathlib.Path | None = None):
     """Load the GoogleNews word2vec binary, or return ``None`` if it is not on disk.
 
-    The file is ~700 MB, gitignored, and downloaded by hand from figshare.  Returning
-    ``None`` lets the caller degrade loudly (one warning) instead of crashing at
-    import; the word-level scorers raise a clear RuntimeError if they are called
-    without it.
+    The Figshare download is about 1.53 GB, is gitignored, and is downloaded
+    separately. Returning ``None`` lets the caller degrade loudly (one warning)
+    instead of crashing at import; the word-level scorers raise a clear RuntimeError
+    if they are called without it.
     """
     global _WORD2VEC, _WORD2VEC_LOADED
 
@@ -81,7 +81,7 @@ def _require_word2vec():
         raise RuntimeError(
             f"word2vec model not found at {ROOT_DIR / WORD2VEC_RELATIVE_PATH}. "
             f"Download it from {WORD2VEC_DOWNLOAD_URL} "
-            "(it is gitignored because it is ~700 MB)."
+            "(it is gitignored because it is a large binary asset)."
         )
     return model
 

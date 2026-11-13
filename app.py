@@ -3,11 +3,12 @@
 Three input modes:
 
 * **Manual Review Input** — one review, analysed synchronously in four comparison
-  columns (Naive Bayes | Logistic Regression | RAKE | BERT Multi-Task).
+  model choices (Naive Bayes | Logistic Regression | RAKE | BERT Multi-Task), with a
+  visible multi-select and all four selected by default.
 * **Google Play Store App URL** — fetch the newest English/US reviews for an app and
-  submit them to the async review service, one job per batch.
+  submit them to the async review service, one BERT job per batch.
 * **CSV Upload** — upload raw reviews with a required ``content`` column and submit
-  them the same way.
+  them the same way. Batch mode uses BERT Multi-Task.
 
 The batch modes talk to the service described in
 ``.claude/plans/aws-deployment.md``: ``POST /jobs`` with one CSV per job,
@@ -33,7 +34,6 @@ ROOT_DIR = pathlib.Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from models.bert_inference import load_bert_cached, predict_sub_comments  # noqa: E402
 from models.scoring import (  # noqa: E402
     WORD2VEC_DOWNLOAD_URL,
     WORD2VEC_RELATIVE_PATH,
@@ -52,6 +52,12 @@ MAX_BATCHES_PER_RUN = 10
 MIN_REVIEWS_PER_BATCH = 100
 MAX_REVIEWS_PER_BATCH = 1000
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MiB
+MANUAL_MODEL_OPTIONS = [
+    "Naive Bayes",
+    "Logistic Regression",
+    "RAKE",
+    "BERT Multi-Task",
+]
 
 # --- review service ------------------------------------------------------
 # Never put AWS credentials in Streamlit or the browser — the app only knows the
@@ -60,6 +66,7 @@ REVIEW_SERVICE_URL = os.environ.get(
     "REVIEW_SERVICE_URL", "http://localhost:8000"
 ).rstrip("/")
 API_TOKEN = os.environ.get("API_TOKEN", "")
+BERT_INFERENCE_MODE = os.environ.get("BERT_INFERENCE_MODE", "local").strip().lower()
 
 RESULT_PREVIEW_ROWS = 1000
 
@@ -120,6 +127,8 @@ def load_classical_artifacts():
 @st.cache_resource
 def load_bert_artifacts():
     """Load the 438 MB BERT checkpoint once per process."""
+    from models.bert_inference import load_bert_cached
+
     return load_bert_cached()
 
 
@@ -228,10 +237,52 @@ def render_rake_column(text: str):
         st.write(f"- {keyword}")
 
 
-def render_bert_column(text: str):
-    st.subheader("BERT Multi-Task Analysis")
-    model, tokenizer, device = load_bert_artifacts()
+def render_bert_results(rows: list[dict], source_label: str):
+    """Render local or service predictions with the same table and rollup."""
+    if not rows:
+        st.warning("BERT returned no sub-comment predictions.")
+        return
 
+    table_rows = []
+    for row in rows:
+        raw_sentiment = row.get("sentiment_raw")
+        table_rows.append(
+            {
+                "sub_comment": row.get("sub_comment") or row.get("text", ""),
+                "topic": row.get("topic", "other"),
+                "topic_confidence": round(float(row.get("topic_conf", 0.0)), 4),
+                # A regression score in [-1, 1] — not a probability.
+                "sentiment": round(float(row.get("sentiment", 0.0)), 3),
+                "sentiment_raw": (
+                    round(float(raw_sentiment), 3)
+                    if raw_sentiment is not None
+                    else None
+                ),
+            }
+        )
+
+    table = pd.DataFrame(table_rows)
+    st.dataframe(
+        table,
+        hide_index=True,
+        alt="BERT topic and sentiment predictions for each review sub-comment",
+    )
+    per_topic = (
+        table.groupby("topic")["topic_confidence"].mean().sort_values(ascending=False)
+    )
+    st.write(
+        f"Dominant topic: {per_topic.index[0]} "
+        f"(mean confidence {per_topic.iloc[0]:.3f})"
+    )
+    st.write(f"Mean sentiment: {table['sentiment'].mean():.2f} (-1.0 to 1.0)")
+    st.caption(f"{TOPIC_LABEL_SUMMARY} · {source_label}")
+
+
+def render_local_bert_column(text: str):
+    st.subheader("BERT Multi-Task Analysis")
+    from models.bert_inference import predict_sub_comments
+
+    model, tokenizer, device = load_bert_artifacts()
     texts, label, fallback_reason = split_review(text)
     if fallback_reason:
         st.warning(
@@ -243,31 +294,43 @@ def render_bert_column(text: str):
         st.caption(f"Split into {len(texts)} sub-comment(s) by {label}")
 
     rows = predict_sub_comments(texts, model, tokenizer)
-    table = pd.DataFrame(
-        [
-            {
-                "sub_comment": row["sub_comment"],
-                "topic": row["topic"],
-                "topic_confidence": round(row["topic_conf"], 4),
-                # A regression score in [-1, 1] — not a probability.
-                "sentiment": round(row["sentiment"], 3),
-                "sentiment_raw": round(row["sentiment_raw"], 3),
-            }
-            for row in rows
-        ]
-    )
-    st.dataframe(table, use_container_width=True)
+    render_bert_results(rows, f"local device: {device}")
 
-    # Rollup: dominant topic (highest mean confidence) and mean sentiment.
-    per_topic = (
-        table.groupby("topic")["topic_confidence"].mean().sort_values(ascending=False)
-    )
-    st.write(
-        f"Dominant topic: {per_topic.index[0]} "
-        f"(mean confidence {per_topic.iloc[0]:.3f})"
-    )
-    st.write(f"Mean sentiment: {table['sentiment'].mean():.2f} (−1.0 to 1.0)")
-    st.caption(f"{TOPIC_LABEL_SUMMARY} · device: {device}")
+
+def render_remote_bert_column(text: str):
+    """Use the deployed inference service so the frontend need not load BERT."""
+    st.subheader("BERT Multi-Task Analysis")
+    if not API_TOKEN:
+        st.error("Remote BERT mode requires API_TOKEN in the frontend environment.")
+        return
+
+    try:
+        response = httpx.post(
+            f"{REVIEW_SERVICE_URL}/predict",
+            headers=_auth_headers(),
+            json={"text": text, "split": True},
+            timeout=120.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        st.error(f"Could not reach the BERT service at {REVIEW_SERVICE_URL}: {exc}")
+        return
+
+    rows = payload.get("sub_comments", [])
+    provider = payload.get("provider", "none")
+    if provider == "none":
+        st.warning("The service used the whole-review fallback because its LLM splitter is unavailable.")
+    else:
+        st.caption(f"Split and labeled by the remote service ({provider})")
+    render_bert_results(rows, "remote service")
+
+
+def render_bert_column(text: str):
+    if BERT_INFERENCE_MODE == "remote":
+        render_remote_bert_column(text)
+    else:
+        render_local_bert_column(text)
 
 
 def get_artifacts():
@@ -278,35 +341,55 @@ def get_artifacts():
         st.stop()
 
 
-def render_review(text: str) -> None:
-    """Render the four-column comparison for a single review."""
-    (
-        lr_model,
-        tfidf_vectorizer,
-        nb_model,
-        count_vectorizer,
-        positive_words,
-        negative_words,
-    ) = get_artifacts()
+def render_review(text: str, selected_models: list[str]) -> None:
+    """Render only the selected model columns for a single review."""
+    selected_models = [
+        name for name in MANUAL_MODEL_OPTIONS if name in (selected_models or [])
+    ]
+    if not selected_models:
+        st.info("Select at least one model to analyze this review.")
+        return
 
-    word2vec_available = get_word2vec() is not None
+    classical = None
+    word2vec_available = False
+    if {"Naive Bayes", "Logistic Regression"}.intersection(selected_models):
+        classical = get_artifacts()
+        word2vec_available = get_word2vec() is not None
+        if not word2vec_available:
+            st.warning(
+                "The word2vec binary is missing. Naive Bayes and Logistic Regression "
+                "still show review-level scores, but word-level colouring is unavailable. "
+                f"Download the 1.53 GB Figshare file and place it at "
+                f"{ROOT_DIR / WORD2VEC_RELATIVE_PATH}."
+            )
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        render_nb_column(text, nb_model, count_vectorizer, word2vec_available)
-    with col2:
-        render_lr_column(
-            text,
-            lr_model,
-            tfidf_vectorizer,
-            positive_words,
-            negative_words,
-            word2vec_available,
-        )
-    with col3:
-        render_rake_column(text)
-    with col4:
-        render_bert_column(text)
+    columns = st.columns(len(selected_models))
+    for name, column in zip(selected_models, columns):
+        with column:
+            if name == "Naive Bayes":
+                _, _, nb_model, count_vectorizer, _, _ = classical
+                render_nb_column(text, nb_model, count_vectorizer, word2vec_available)
+            elif name == "Logistic Regression":
+                (
+                    lr_model,
+                    tfidf_vectorizer,
+                    _,
+                    _,
+                    positive_words,
+                    negative_words,
+                ) = classical
+                render_lr_column(
+                    text,
+                    lr_model,
+                    tfidf_vectorizer,
+                    positive_words,
+                    negative_words,
+                    word2vec_available,
+                )
+            elif name == "RAKE":
+                render_rake_column(text)
+            elif name == "BERT Multi-Task":
+                render_bert_column(text)
 
 
 # =========================================================================
@@ -551,7 +634,11 @@ def render_batch_results(run: dict) -> None:
         if job["status"] == "FAILED":
             failed.append(job)
 
-    st.dataframe(pd.DataFrame(statuses), use_container_width=True)
+    st.dataframe(
+        pd.DataFrame(statuses),
+        hide_index=True,
+        alt="Progress for each submitted review batch",
+    )
 
     total = sum(j["total_reviews"] for j in jobs) or 1
     done = sum(j["completed_reviews"] for j in jobs)
@@ -588,7 +675,11 @@ def render_batch_results(run: dict) -> None:
         )
 
     st.write(f"**{len(combined)} sub-comment rows** from {len(completed)} batch(es).")
-    st.dataframe(render_result_table(combined), use_container_width=True)
+    st.dataframe(
+        render_result_table(combined),
+        hide_index=True,
+        alt="Combined BERT topic and sentiment results",
+    )
 
     st.download_button(
         "Download the full annotated CSV",
@@ -666,7 +757,7 @@ input_mode = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.markdown(
     """
-**Model Differences:**
+**Model guide** — choose models in the main panel for manual reviews:
 - 🤖 **Logistic Regression**:
   - Uses TF-IDF weighting
   - Considers feature importance
@@ -684,7 +775,7 @@ st.sidebar.markdown(
 - 🗣️ **BERT (multi-task)**:
   - Topic classification + sentiment regression
   - Labels each sub-comment separately
-  - Runs locally, no API call
+  - Runs locally in development or through the service when hosted
 """
 )
 st.sidebar.markdown("---")
@@ -692,23 +783,32 @@ st.sidebar.markdown(
     "[AIPI540_nlp_project](https://github.com/ruhan-dave/AIPI540_nlp_project)"
 )
 
-if get_word2vec() is None:
-    st.warning(
-        "The word2vec binary is not installed, so the Naive Bayes and Logistic "
-        "Regression columns show review-level scores without word-level colouring. "
-        f"Download it from {WORD2VEC_DOWNLOAD_URL} and place it at "
-        f"{ROOT_DIR / WORD2VEC_RELATIVE_PATH} (it is gitignored — ~700 MB)."
-    )
-
 if input_mode == "Manual Review Input":
+    st.subheader("Manual review analysis")
+    with st.container(border=True):
+        st.markdown("### Choose models to run")
+        st.caption(
+            "All four are selected by default. Select one or more models to compare."
+        )
+        selected_models = st.pills(
+            "Models to run",
+            options=MANUAL_MODEL_OPTIONS,
+            selection_mode="multi",
+            default=MANUAL_MODEL_OPTIONS,
+            key="manual_model_selection",
+            help="Choose which model columns to show for this review.",
+        )
     new_review = st.text_area(
         "Enter a review:", "This app is terrible and crashes constantly."
     )
     if new_review:
-        render_review(new_review)
+        render_review(new_review, selected_models or [])
 
 elif input_mode == "Google Play Store App URL":
     st.subheader("Google Play Store batch run")
+    st.info(
+        "Batch jobs always use BERT Multi-Task. The model selector applies to manual reviews."
+    )
     app_url = st.text_input("Enter the Google Play Store app URL:")
     num_batches, reviews_per_batch, requested_reviews = batch_controls()
 
@@ -735,11 +835,18 @@ elif input_mode == "Google Play Store App URL":
                         f"Fetched {len(reviews_df)} review(s); "
                         f"{len(reviews_df)} are available for selection."
                     )
-                    st.dataframe(reviews_df.head(10), use_container_width=True)
+                    st.dataframe(
+                        reviews_df.head(10),
+                        hide_index=True,
+                        alt="Preview of the newest Google Play reviews",
+                    )
                     run_batch(reviews_df, num_batches, reviews_per_batch)
 
 elif input_mode == "CSV Upload":
     st.subheader("CSV batch run")
+    st.info(
+        "Batch jobs always use BERT Multi-Task. The model selector applies to manual reviews."
+    )
     st.markdown(
         "Upload a CSV of raw reviews. The **`content`** column is required; any other "
         "columns (for example `score` and `date`) are preserved in the result."
@@ -762,7 +869,11 @@ elif input_mode == "CSV Upload":
                 f"{len(source_df)} row(s) available, {requested_reviews} requested. "
                 f"Up to {len(source_df)} can be processed."
             )
-            st.dataframe(source_df.head(10), use_container_width=True)
+            st.dataframe(
+                source_df.head(10),
+                hide_index=True,
+                alt="Preview of uploaded review rows",
+            )
             run_batch(source_df, num_batches, reviews_per_batch)
 
 render_run_progress()

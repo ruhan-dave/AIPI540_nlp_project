@@ -96,15 +96,20 @@ streamlit run app.py
 
 | Mode | What it does |
 |---|---|
-| **Manual Review Input** | Analyzes one typed review synchronously in **four** comparison columns — Naive Bayes, Logistic Regression, RAKE, and BERT Multi-Task. |
-| **Google Play Store App URL** | Fetches the newest English/US reviews for an app and submits them to the async review service, one job per batch. |
-| **CSV Upload** | Uploads raw reviews and submits them the same way. |
+| **Manual Review Input** | Analyzes one typed review with a prominent multi-select for Naive Bayes, Logistic Regression, RAKE, and BERT Multi-Task (all selected by default). |
+| **Google Play Store App URL** | Fetches the newest English/US reviews for an app and submits BERT jobs to the async review service, one job per batch. |
+| **CSV Upload** | Uploads raw reviews and submits BERT jobs the same way. |
 
-### The four columns
+### Manual model selection
+
+Choose one or more models from the visible **Models to run** pills in the main panel. All four are
+selected by default; only selected columns run. URL and CSV batch jobs always use BERT Multi-Task.
+
+### Model behavior
 
 - **Naive Bayes** and **Logistic Regression** show a review-level `Positive` / `Negative`
   percentage and colour the sentence word by word. Word-level colouring needs the word2vec binary
-  (gitignored, ~700 MB — see the setup below); without it the columns still show the review-level
+  (gitignored, about 1.53 GB from Figshare — see the setup below); without it the columns still show the review-level
   scores.
 - **RAKE** lists the review's top keyword phrases. It needs no model and no word2vec.
 - **BERT Multi-Task** splits the review into sub-comments with the configured LLM provider, labels
@@ -147,13 +152,19 @@ and `split_fallback` (preview capped at 1,000 rows, with the full row count show
 combined annotated CSV is available for download.
 
 Batch mode talks to the review service described in `.claude/plans/aws-deployment.md`; point the
-app at it with `REVIEW_SERVICE_URL` (default `http://localhost:8000`) and `API_TOKEN`.
+local app at it with `REVIEW_SERVICE_URL` (default `http://localhost:8000`) and `API_TOKEN`. The
+Railway frontend uses `BERT_INFERENCE_MODE=remote` and the AWS API's HTTPS URL.
 
-## install dependencies
+## Install dependencies
 
 ```bash
-pip install -r requirements.txt
+python3.12 -m venv .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
+
+Run these commands from the repository root. The project pins a PyArrow version compatible with NumPy 1.26 and a
+scikit-learn version matching the saved model pickles.
 
 ## Data Preprocessing
 
@@ -191,4 +202,7 @@ construction and is not accuracy against human ground truth.
   100 MB per-file limit. The rest of the checkpoint directory is tracked; copy the weights in
   separately.
 - `models/trained_model/GoogleNews-vectors-negative300.bin.gz` is gitignored and must be
-  downloaded by hand (figshare link in `models/scoring.py`).
+  downloaded by hand (about 1.53 GB; Figshare link in `models/scoring.py`). In production, upload it directly
+  to the Railway frontend's persistent Volume using `railway volume files upload`; it is not in the AWS
+  API/worker image or AWS job-data S3 bucket. Keep a local backup because Railway Volume-only storage has no
+  separate remote recovery copy.

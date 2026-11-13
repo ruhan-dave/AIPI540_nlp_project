@@ -1,0 +1,41 @@
+# The backend image must contain models/saved_bert_model/ — the checkpoint is
+# gitignored but it is baked into the image and loaded from local files only.
+# Do not add that directory to this file.
+
+# Credentials and local environment.
+.env
+.env.*
+!.env.example
+
+# Python.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Version control and OS noise.
+.git/
+.gitignore
+.DS_Store
+
+# Not needed at runtime.
+data/
+notebooks/
+screenshots/
+all_rag_techniques/
+infra/
+models/machine_learning.py
+models/*.pkl
+models/trained_model/
+models/highlighted_sentence.html
+models/highlighted_sentence_rake.html
+models/tokenizers/
+
+# The AI layer is not part of the runtime image.
+.claude/
+.agents/
+
+# Documentation.
+*.md

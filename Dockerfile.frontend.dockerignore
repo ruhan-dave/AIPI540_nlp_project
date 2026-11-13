@@ -1,0 +1,34 @@
+# The frontend image is built from the whole repository, so it needs the trained
+# pickles (models/*.pkl) that the backend image leaves out.
+#
+# It does not need the BERT checkpoint: in the hosted environment the app calls
+# the remote service instead of loading BERT locally.
+
+.env
+.env.*
+!.env.example
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+.git/
+.gitignore
+.DS_Store
+
+data/
+notebooks/
+screenshots/
+all_rag_techniques/
+infra/
+models/saved_bert_model/
+models/machine_learning.py
+models/tokenizers/
+
+.claude/
+.agents/
+
+*.md

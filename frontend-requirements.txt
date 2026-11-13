@@ -1,0 +1,23 @@
+# Dependencies of the ReviewAssist frontend image (Streamlit on Railway).
+#
+# Torch and Transformers are deliberately absent: in the hosted environment
+# BERT_INFERENCE_MODE is "remote" and the app calls the AWS API instead of
+# loading the 438 MB checkpoint locally.
+#
+# The GoogleNews word2vec binary (about 1.53 GB) is not a Python dependency and
+# not in the image: it lives on a Railway Volume mounted at
+# /app/models/trained_model.
+
+streamlit==1.67.0
+pandas==2.2.3
+pyarrow==19.0.1
+numpy==1.26.4
+scikit-learn==1.7.2
+scipy==1.12.0
+gensim==4.3.3
+nltk==3.9.1
+rake-nltk==1.0.6
+contractions==0.1.73
+httpx==0.28.1
+python-dotenv==1.0.1
+google-play-scraper==1.2.7

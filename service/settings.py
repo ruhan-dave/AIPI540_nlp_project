@@ -79,6 +79,7 @@ class Settings:
 
     # Limits
     max_upload_bytes: int
+    max_multipart_upload_bytes: int
     max_reviews_per_job: int
     worker_chunk_size: int
     bert_batch_size: int
@@ -90,6 +91,10 @@ class Settings:
     job_lease_seconds: int
     job_ttl_days: int
     result_url_ttl_seconds: int
+    upload_url_ttl_seconds: int
+    predict_timeout_seconds: int
+    predict_deadline_seconds: int
+    worker_split_timeout_seconds: int
 
     # Saturation
     max_inflight_predicts: int
@@ -119,6 +124,9 @@ class Settings:
             api_token=_env_str(env, "API_TOKEN"),
             llm_provider=_env_str(env, "LLM_PROVIDER", "openrouter").lower(),
             max_upload_bytes=_env_int(env, "MAX_UPLOAD_BYTES", 50 * MIB),
+            max_multipart_upload_bytes=_env_int(
+                env, "MAX_MULTIPART_UPLOAD_BYTES", 8 * MIB
+            ),
             max_reviews_per_job=_env_int(env, "MAX_REVIEWS_PER_JOB", 1000),
             worker_chunk_size=_env_int(env, "WORKER_CHUNK_SIZE", 25),
             bert_batch_size=_env_int(env, "BERT_BATCH_SIZE", 64),
@@ -128,6 +136,12 @@ class Settings:
             job_lease_seconds=_env_int(env, "JOB_LEASE_SECONDS", 600),
             job_ttl_days=_env_int(env, "JOB_TTL_DAYS", 7),
             result_url_ttl_seconds=_env_int(env, "RESULT_URL_TTL_SECONDS", 900),
+            upload_url_ttl_seconds=_env_int(env, "UPLOAD_URL_TTL_SECONDS", 900),
+            predict_timeout_seconds=_env_int(env, "PREDICT_TIMEOUT_SECONDS", 20),
+            predict_deadline_seconds=_env_int(env, "PREDICT_DEADLINE_SECONDS", 25),
+            worker_split_timeout_seconds=_env_int(
+                env, "WORKER_SPLIT_TIMEOUT_SECONDS", 60
+            ),
             max_inflight_predicts=_env_int(env, "MAX_INFLIGHT_PREDICTS", 4),
             rate_limit_per_minute=_env_int(env, "RATE_LIMIT_PER_MINUTE", 120),
             log_level=_env_str(env, "LOG_LEVEL", "INFO").upper(),
@@ -163,6 +177,23 @@ class Settings:
             raise ConfigurationError("BERT_BATCH_SIZE must be at least 1")
         if self.max_upload_bytes < 1:
             raise ConfigurationError("MAX_UPLOAD_BYTES must be positive")
+        if self.max_multipart_upload_bytes < 1:
+            raise ConfigurationError("MAX_MULTIPART_UPLOAD_BYTES must be positive")
+        if self.max_multipart_upload_bytes > self.max_upload_bytes:
+            raise ConfigurationError(
+                "MAX_MULTIPART_UPLOAD_BYTES must not exceed MAX_UPLOAD_BYTES"
+            )
+        if self.upload_url_ttl_seconds < 1:
+            raise ConfigurationError("UPLOAD_URL_TTL_SECONDS must be at least 1")
+        if self.predict_timeout_seconds < 1:
+            raise ConfigurationError("PREDICT_TIMEOUT_SECONDS must be at least 1")
+        if self.predict_deadline_seconds <= self.predict_timeout_seconds:
+            raise ConfigurationError(
+                "PREDICT_DEADLINE_SECONDS must be longer than PREDICT_TIMEOUT_SECONDS, "
+                "otherwise the split alone could exhaust the prediction budget"
+            )
+        if self.worker_split_timeout_seconds < 1:
+            raise ConfigurationError("WORKER_SPLIT_TIMEOUT_SECONDS must be at least 1")
         if self.heartbeat_interval < 1:
             raise ConfigurationError("HEARTBEAT_INTERVAL must be at least 1")
         if self.job_lease_seconds <= self.heartbeat_interval:

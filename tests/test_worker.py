@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 
 from service.batch_io import read_result_csv
 from service.inference import Splitter
+from service.settings import Settings
+from service.worker import build_worker as build_worker_from_settings
 from service.jobs import COMPLETED, FAILED, RETRYABLE
 from service.server import ServiceContext
 from service.worker import Heartbeat, JobWorker
@@ -243,3 +245,24 @@ def test_the_heartbeat_renews_the_visibility_and_the_lease(
 
     assert aws_stack.jobs.get(job_id)["lease_expires_at"] > before
     assert any(record.message == "job_heartbeat" for record in caplog.records)
+
+
+def test_the_worker_waits_longer_for_one_split_than_the_api_does() -> None:
+    """The worker has no gateway in front of it and can afford a longer budget.
+
+    The API's budget has to fit inside the API Gateway's integration timeout;
+    applying it to a background job would turn slow reviews into whole-review
+    fallbacks for no reason.
+    """
+    settings = Settings.from_env(
+        {
+            "JOB_BUCKET": "b",
+            "QUEUE_URL": "q",
+            "JOBS_TABLE": "t",
+            "API_TOKEN": "tok",
+            "PREDICT_TIMEOUT_SECONDS": "20",
+            "WORKER_SPLIT_TIMEOUT_SECONDS": "90",
+        }
+    )
+    worker = build_worker_from_settings(settings)
+    assert worker.splitter.timeout == 90

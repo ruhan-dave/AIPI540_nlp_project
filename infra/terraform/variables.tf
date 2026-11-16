@@ -25,6 +25,24 @@ variable "public_subnet_ids" {
   }
 }
 
+variable "alb_subnet_ids" {
+  description = "The subnets the internal load balancer sits in. Empty means `public_subnet_ids`: the load balancer is internal, so the subnets only have to be routable to the VPC link's network interfaces."
+  type        = list(string)
+  default     = []
+}
+
+variable "vpc_link_subnet_ids" {
+  description = "The subnets the API Gateway VPC link places its network interfaces in. Empty means `public_subnet_ids`. The link must reach the load balancer, so these subnets have to be routable to the load balancer's subnets."
+  type        = list(string)
+  default     = []
+}
+
+variable "vpc_link_security_group_ids" {
+  description = "Security groups for the API Gateway VPC link's network interfaces. Empty means the stack creates one that can reach the load balancer over private HTTP."
+  type        = list(string)
+  default     = []
+}
+
 variable "api_image_tag" {
   description = "The tag of the backend image in the ECR repository. The image must be pushed before the services are started."
   type        = string
@@ -32,13 +50,25 @@ variable "api_image_tag" {
 }
 
 variable "api_domain_name" {
-  description = "The public DNS name of the API, for example api.reviewassist.example. Point it at the load balancer's DNS name and serve it with the ACM certificate."
+  description = "REMOVED — the API Gateway HTTP API's generated execute-api endpoint is the public URL, so no domain and no ACM certificate are needed. Kept as a deprecated no-op so a stale `terraform.tfvars` naming it is rejected rather than silently ignored."
   type        = string
+  default     = null
+
+  validation {
+    condition     = var.api_domain_name == null
+    error_message = "api_domain_name is no longer used: the public endpoint is the API Gateway's generated execute-api URL. Remove it from terraform.tfvars."
+  }
 }
 
 variable "acm_certificate_arn" {
-  description = "The ARN of an ACM certificate in this region covering `api_domain_name`."
+  description = "REMOVED — the public HTTPS endpoint is the API Gateway's generated execute-api address, which comes with its own certificate. Kept as a deprecated no-op so a stale `terraform.tfvars` naming it is rejected rather than silently ignored."
   type        = string
+  default     = null
+
+  validation {
+    condition     = var.acm_certificate_arn == null
+    error_message = "acm_certificate_arn is no longer used: the load balancer is internal and the public endpoint is the API Gateway's generated execute-api URL. Remove it from terraform.tfvars."
+  }
 }
 
 variable "api_secret_arn" {
@@ -83,9 +113,60 @@ variable "desired_count" {
 }
 
 variable "max_upload_bytes" {
-  description = "The largest CSV a single job may carry (50 MiB)."
+  description = "The largest CSV a single job may carry (50 MiB). This is the limit for the presigned S3 upload path, where the CSV never passes through the API Gateway."
   type        = number
   default     = 52428800
+}
+
+variable "max_multipart_upload_bytes" {
+  description = "The largest CSV the multipart `POST /jobs` route accepts (8 MiB). An API Gateway HTTP API caps a request payload at 10 MB and that limit cannot be raised, so the multipart path is sized to leave room for the multipart framing."
+  type        = number
+  default     = 8388608
+}
+
+variable "upload_url_ttl_seconds" {
+  description = "How long a presigned upload URL stays valid."
+  type        = number
+  default     = 900
+}
+
+variable "predict_timeout_seconds" {
+  description = "The budget for one LLM split request, provider retries included. A split that overruns it falls back to the whole review."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.predict_timeout_seconds < var.predict_deadline_seconds
+    error_message = "predict_timeout_seconds must be shorter than predict_deadline_seconds, or the split could exhaust the whole prediction budget on its own."
+  }
+}
+
+variable "worker_split_timeout_seconds" {
+  description = "The budget for one LLM split in the worker. The worker has no gateway in front of it and can afford to wait longer than the API's budget for one review's split."
+  type        = number
+  default     = 60
+}
+
+variable "predict_deadline_seconds" {
+  description = "The total budget for one `POST /predict`, split and BERT included. A request that overruns it returns the whole-review fallback instead of being cut off by the API Gateway."
+  type        = number
+  default     = 25
+
+  validation {
+    condition     = var.predict_deadline_seconds < floor(var.http_api_integration_timeout_ms / 1000)
+    error_message = "predict_deadline_seconds must be shorter than the API Gateway integration timeout, or the gateway would answer 504 while the API was still working."
+  }
+}
+
+variable "http_api_integration_timeout_ms" {
+  description = "The API Gateway integration timeout in milliseconds. The HTTP API maximum is 30000 and it cannot be raised, so the service's prediction deadline has to fit inside it."
+  type        = number
+  default     = 29000
+
+  validation {
+    condition     = var.http_api_integration_timeout_ms > 0 && var.http_api_integration_timeout_ms <= 30000
+    error_message = "http_api_integration_timeout_ms must be between 1 and 30000 — an HTTP API's integration timeout cannot exceed 30 seconds."
+  }
 }
 
 variable "max_reviews_per_job" {

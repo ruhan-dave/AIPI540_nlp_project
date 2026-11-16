@@ -24,12 +24,22 @@ output "worker_service_name" {
 }
 
 output "api_url" {
-  description = "The public HTTPS URL the frontend calls. Point the API domain at the load balancer's DNS name."
-  value       = "https://${var.api_domain_name}"
+  description = "The public HTTPS URL the frontend calls: the API Gateway HTTP API's generated execute-api endpoint."
+  value       = aws_apigatewayv2_api.http.api_endpoint
+}
+
+output "http_api_id" {
+  description = "The API Gateway HTTP API's id."
+  value       = aws_apigatewayv2_api.http.id
+}
+
+output "vpc_link_id" {
+  description = "The API Gateway VPC link that reaches the internal load balancer."
+  value       = aws_apigatewayv2_vpc_link.api.id
 }
 
 output "alb_dns_name" {
-  description = "The load balancer's DNS name — the target of the API domain's A/ALIAS record."
+  description = "The internal load balancer's DNS name. It resolves only inside the VPC — the frontend calls the API Gateway endpoint, not this name."
   value       = aws_lb.api.dns_name
 }
 

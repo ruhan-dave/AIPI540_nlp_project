@@ -82,6 +82,39 @@ class JobCreated(pydantic.BaseModel):
     total_reviews: int
 
 
+class UploadRequest(pydantic.BaseModel):
+    """The body of ``POST /jobs/uploads``.
+
+    ``filename`` is informational only — the key the CSV is uploaded to is
+    chosen by the server, never by the caller.
+    """
+
+    filename: str | None = pydantic.Field(
+        default=None, max_length=200, description="the caller's file name, for logs"
+    )
+
+
+class UploadTicket(pydantic.BaseModel):
+    """The response to ``POST /jobs/uploads``.
+
+    ``upload_url`` is a short-lived, key-scoped presigned URL: it authorises
+    exactly one PUT to ``input_key`` and nothing else.  ``upload_id`` is also
+    the id of the job that the upload turns into, so finalizing it twice is
+    refused rather than creating a second job for the same object.
+    """
+
+    upload_id: str
+    upload_url: str
+    input_key: str
+    expires_in: int
+
+
+class FinalizeRequest(pydantic.BaseModel):
+    """The body of ``POST /jobs/uploads/{upload_id}/finalize``."""
+
+    options: JobOptions = pydantic.Field(default_factory=JobOptions)
+
+
 class JobState(pydantic.BaseModel):
     """The response to ``GET /jobs/{job_id}``."""
 

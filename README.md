@@ -215,12 +215,16 @@ HTTPS. AWS resources are provisioned with Terraform; the Railway service and its
 by hand (or with the Railway CLI).
 
 ```
-Railway (Streamlit)  ──HTTPS + bearer token──▶  ALB  ──▶  ECS/Fargate API  ──▶  SQS
-                                                                                    │
-                                                                            ECS/Fargate worker
-                                                                                    │
-                                                            S3 (job input/result) ◀──┘
+Railway (Streamlit)  ──HTTPS + bearer token──▶  API Gateway  ──private HTTP──▶  ALB  ──▶  ECS/Fargate API
+   (execute-api URL)                                   (VPC link)        (internal)                  │
+                                                                                        ECS/Fargate worker
+                                                                                                  │
+                                                              S3 (job input/result) ◀────────────┘
 ```
+
+The API Gateway's generated `execute-api` endpoint is the only public surface. It has AWS's own
+certificate, so there is no domain to buy and no ACM certificate to renew, and the load balancer
+behind it is internal — it resolves only inside the VPC.
 
 ### The API
 
@@ -228,12 +232,20 @@ Railway (Streamlit)  ──HTTPS + bearer token──▶  ALB  ──▶  ECS/Fa
 |---|---|---|
 | `GET /healthz` | none | `503 {"status":"loading"}` until the local checkpoint loads, then `200 {"status":"ready"}`. |
 | `POST /predict` | bearer | One review in, split and labelled sub-comments out. |
-| `POST /jobs` | bearer | One CSV upload (≤ 50 MiB, ≤ 1,000 reviews, a `content` column) becomes one job. |
+| `POST /jobs/uploads` | bearer | A short-lived presigned PUT URL for one CSV, plus the key to upload it to. |
+| `POST /jobs/uploads/{upload_id}/finalize` | bearer | Verifies the uploaded CSV, creates the job and enqueues it. |
+| `POST /jobs` | bearer | One CSV multipart upload (≤ 8 MiB, ≤ 1,000 reviews, a `content` column) becomes one job. |
 | `GET /jobs/{job_id}` | bearer | Status plus `completed_reviews` and `total_reviews`. |
 | `GET /jobs/{job_id}/result` | bearer | A short-lived presigned URL, only after the job completes. |
 
 Every route except `/healthz` needs `Authorization: Bearer $API_TOKEN`. `429` means the client is over
 its rate limit; `503` means the model is not ready or the service is saturated.
+
+**Why the upload is split in two.** An API Gateway HTTP API caps a request payload at 10 MB and that
+cap cannot be raised, so a 50 MiB CSV cannot be posted through it. The frontend therefore asks for a
+presigned URL, uploads the CSV straight to the private S3 bucket, and finalizes the upload. The
+frontend never holds AWS credentials — the URL authorises one PUT to one key. The multipart
+`POST /jobs` route still works for smaller files and is capped at 8 MiB.
 
 ### Terraform
 
@@ -268,10 +280,10 @@ configuration, or in a Terraform variable** — they live in Secrets Manager and
 variables.
 
 The stack needs an **existing VPC** with at least two public subnets in different Availability
-Zones, a **public DNS name** for the API, and an **ACM certificate** for that name in the same
-region. Point the domain at the load balancer's DNS name (`terraform output -raw alb_dns_name`).
-If the domain or the certificate is not available, **do not** fall back to plain HTTP — the bearer
-token would cross the internet in the clear.
+Zones. The public endpoint is the API Gateway's generated `execute-api` URL
+(`terraform output -raw api_url`), so no domain and no ACM certificate are needed. The load
+balancer is internal and is only reachable through the API Gateway's VPC link — there is no public
+ingress path to it.
 
 ### Applying, in two stages
 
@@ -316,7 +328,7 @@ Railway variables:
 | Variable | Value |
 |---|---|
 | `BERT_INFERENCE_MODE` | `remote` |
-| `REVIEW_SERVICE_URL` | `https://<your API domain>` |
+| `REVIEW_SERVICE_URL` | the API Gateway endpoint — `terraform output -raw api_url` |
 | `API_TOKEN` | the same token that is in the AWS secret — server-side only |
 
 The start command is `streamlit run app.py --server.address 0.0.0.0 --server.port $PORT`; Railway
@@ -340,9 +352,10 @@ one replica until the volume's behaviour across replicas has been verified.
 
 ### Cost and access
 
-- The AWS API and the worker each run 1 vCPU / 2 GiB on Fargate, plus the ALB, SQS, DynamoDB and
-  S3. Railway charges for the frontend and its Volume separately. Recalculate both before
-  deploying, and **do not leave either environment running after the demo**.
+- The AWS API and the worker each run 1 vCPU / 2 GiB on Fargate, plus the internal ALB, the API
+  Gateway and its VPC link, SQS, DynamoDB and S3. Railway charges for the frontend and its Volume
+  separately. Recalculate both before deploying, and **do not leave either environment running
+  after the demo**.
 - **The frontend is public by default.** A server-side `API_TOKEN` protects the API, but it does
   not stop a visitor from spending your LLM credits by triggering jobs through the UI. Restrict
   access with application authentication or Railway's access controls.

@@ -42,12 +42,12 @@ AIPI540_nlp_project/
     inference.py           # ModelRuntime (the local BERT checkpoint) + Splitter (the LLM split)
     batch_io.py            # CSV validation, chunking, result assembly, the S3 object helpers
     jobs.py                # the DynamoDB job store (status, lease, claims) + the SQS queue
-    server.py              # FastAPI: /healthz, /predict, /jobs
+    server.py              # FastAPI: /healthz, /predict, /jobs, /jobs/uploads
     worker.py              # the SQS worker: chunk checkpoints, 60 s heartbeats, DLQ behaviour
   Dockerfile               # the backend image: CPU-only torch, the checkpoint baked in
   Dockerfile.frontend      # the Railway frontend image: Streamlit, no torch
   infra/bootstrap/         # Terraform: the remote-state bucket (one-time)
-  infra/terraform/         # Terraform: ECR, ECS/Fargate, ALB, SQS, DynamoDB, S3, secrets, IAM
+  infra/terraform/         # Terraform: ECR, ECS/Fargate, internal ALB, API Gateway + VPC link, SQS, DynamoDB, S3, secrets, IAM
   tests/                   # the service tests — moto-backed S3/SQS/DynamoDB
   .claude/                 # AI layer: 37 skills, 6 agents, 8 hooks, 8 reference docs (untracked)
 ```
@@ -124,6 +124,20 @@ needs, which `processed_data.csv` does not.
   `service/worker.py` log identifiers (`job_id`, chunk index, progress) and error *types*, never the payload.
 - **The SQS message carries a pointer, never a payload.** `service/jobs.py:JobQueue.send` puts only
   `{job_id, input_key, options}` on the queue; the review text stays in the private S3 bucket.
+- **The public boundary is the API Gateway, not the load balancer.** The ALB is `internal = true` with a
+  private HTTP listener that only the VPC link's security group may reach; the public URL is the API
+  Gateway's generated `execute-api` endpoint (`terraform output -raw api_url`). There is no domain and no
+  ACM certificate. Do not add a public listener to the ALB — the gateway's integration timeout (29 s) and
+  10 MB payload cap are the two limits the service is built around.
+- **A CSV over the multipart limit goes through the presigned upload flow.** An HTTP API caps a payload at
+  10 MB and cannot raise it, so `POST /jobs` is capped at `MAX_MULTIPART_UPLOAD_BYTES` (8 MiB) while the
+  full 50 MiB contract lives on `POST /jobs/uploads` → `POST /jobs/uploads/{upload_id}/finalize`. The
+  upload id becomes the job id, so finalizing twice is refused. The frontend holds no AWS credentials.
+- **`/predict` answers inside the gateway's timeout.** The provider call gets `PREDICT_TIMEOUT_SECONDS`
+  (20 s) and the whole split runs under `PREDICT_DEADLINE_SECONDS` (25 s). On overrun the split is
+  *abandoned, not cancelled* — it is already paid for — and the caller gets the whole-review fallback.
+  The gateway must never be the thing that ends a request. The worker has no gateway in front of it and
+  keeps its own, longer budget (`WORKER_SPLIT_TIMEOUT_SECONDS`, 60 s).
 - **The backend image must keep `models/saved_bert_model/`** — `.dockerignore` deliberately does not exclude it.
   `model.safetensors` is gitignored but must ship in the image, and the image sets `HF_HUB_OFFLINE=1` /
   `TRANSFORMERS_OFFLINE=1` with an empty `HF_HOME`, so a cold start can never reach the network.

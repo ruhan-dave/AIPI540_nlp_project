@@ -17,13 +17,20 @@ public_subnet_ids = [
   "subnet-0fedcba9876543210",
 ]
 
+# The internal load balancer and the API Gateway VPC link. Leave these empty to
+# reuse `public_subnet_ids`; the load balancer is internal, so its subnets only
+# have to be routable to the VPC link's network interfaces.
+alb_subnet_ids            = []
+vpc_link_subnet_ids       = []
+vpc_link_security_group_ids = []
+
 # The tag of the backend image in ECR. Push the image before raising
 # desired_count above 0.
 api_image_tag = "v1"
 
-# The public HTTPS name the frontend calls, and its ACM certificate.
-api_domain_name    = "api.reviewassist.example"
-acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+# The public endpoint is the API Gateway HTTP API's generated execute-api URL
+# (`terraform output -raw api_url`). It comes with AWS's own certificate, so
+# there is no domain to buy and no ACM certificate to renew.
 
 # Which provider splits the reviews.
 llm_provider = "openrouter"

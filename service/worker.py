@@ -161,6 +161,11 @@ class JobWorker:
         """The model runtime this worker labels with."""
         return self._runtime
 
+    @property
+    def splitter(self) -> Splitter:
+        """The splitter this worker splits reviews with."""
+        return self._splitter
+
     # --- the loop ----------------------------------------------------------
 
     def run_forever(self, stop_event: threading.Event) -> None:
@@ -420,7 +425,7 @@ def build_worker(settings: Settings) -> JobWorker:
         queue=JobQueue(settings.queue_url, region=settings.aws_region),
         s3=build_s3_client(settings.aws_region),
         runtime=runtime,
-        splitter=Splitter(settings),
+        splitter=Splitter(settings, timeout=settings.worker_split_timeout_seconds),
     )
 
 

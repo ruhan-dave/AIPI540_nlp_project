@@ -229,3 +229,36 @@ def presign_object_get(client: Any, bucket: str, key: str, expires_in: int) -> s
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_in,
     )
+
+
+def presign_object_put(client: Any, bucket: str, key: str, expires_in: int) -> str:
+    """Build a short-lived, key-scoped presigned PUT URL for an S3 object.
+
+    The URL authorises exactly one PUT to ``key`` and nothing else — the caller
+    cannot redirect it to another object, and it cannot read anything back.
+    That is what lets the frontend upload a CSV straight to the private bucket
+    without ever holding AWS credentials.
+    """
+    return client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_in,
+    )
+
+
+def object_size(client: Any, bucket: str, key: str) -> int | None:
+    """The size of an S3 object in bytes, or ``None`` when it does not exist.
+
+    A missing object is an ordinary outcome here — the caller has not uploaded
+    the file yet — so it is reported rather than raised.
+    """
+    from botocore.exceptions import ClientError
+
+    try:
+        response = client.head_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+    return int(response["ContentLength"])

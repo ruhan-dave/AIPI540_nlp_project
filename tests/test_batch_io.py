@@ -8,6 +8,8 @@ from service.batch_io import (
     CsvValidationError,
     chunked,
     iter_review_rows,
+    object_size,
+    presign_object_put,
     read_result_csv,
     result_columns,
     validate_review_csv,
@@ -15,6 +17,9 @@ from service.batch_io import (
 )
 
 VALID = b"content,score\nThe app is great,5\nThe app crashes,1\n"
+
+#: The bucket the S3-helper tests write to.
+BUCKET = "reviewassist-jobs-test"
 
 
 def test_validate_accepts_a_valid_csv() -> None:
@@ -115,3 +120,23 @@ def test_write_result_csv_fills_missing_columns() -> None:
     body = write_result_csv([{"content": "hello"}], ["content", "bert_topic"])
     parsed = read_result_csv(body)
     assert parsed[0]["bert_topic"] == ""
+
+
+# --- S3 object helpers ----------------------------------------------------
+
+
+def test_presign_object_put_scopes_the_url_to_one_key(aws_stack) -> None:
+    """The upload URL authorises one PUT to one key and nothing else."""
+    url = presign_object_put(aws_stack.s3, BUCKET, "inputs/abc/reviews.csv", 900)
+    assert "inputs/abc/reviews.csv" in url.replace("%2F", "/")
+    assert "X-Amz-Signature" in url
+    assert "X-Amz-Expires=900" in url
+
+
+def test_object_size_reports_the_size_of_an_object(aws_stack) -> None:
+    aws_stack.s3.put_object(Bucket=BUCKET, Key="inputs/x/reviews.csv", Body=VALID)
+    assert object_size(aws_stack.s3, BUCKET, "inputs/x/reviews.csv") == len(VALID)
+
+
+def test_object_size_reports_a_missing_object_as_none(aws_stack) -> None:
+    assert object_size(aws_stack.s3, BUCKET, "inputs/nope/reviews.csv") is None

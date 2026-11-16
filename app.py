@@ -11,13 +11,13 @@ Three input modes:
   them the same way. Batch mode uses BERT Multi-Task.
 
 The batch modes talk to the service described in
-``.claude/plans/aws-deployment.md``: ``POST /jobs`` with one CSV per job,
+``.claude/plans/aws-deployment.md``: ``POST /jobs/uploads`` for a presigned URL,
+``POST /jobs/uploads/{upload_id}/finalize`` to turn the uploaded CSV into a job,
 ``GET /jobs/{job_id}`` for progress, and ``GET /jobs/{job_id}/result`` for the
 finished CSV.
 """
 
 import io
-import json
 import os
 import pathlib
 import pickle
@@ -512,6 +512,61 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
 
 
+def upload_batch_csv(payload: bytes, filename: str) -> str:
+    """Upload one batch CSV and return the job id it became.
+
+    The CSV goes straight to the private S3 bucket through a short-lived
+    presigned URL, so it never passes through the API Gateway — whose 10 MB
+    payload cap cannot be raised.  The service chooses the key and the frontend
+    never holds AWS credentials; the URL authorises one PUT to one key.
+    """
+    ticket = httpx.post(
+        f"{REVIEW_SERVICE_URL}/jobs/uploads",
+        headers=_auth_headers(),
+        json={"filename": filename},
+        timeout=60.0,
+    )
+    if ticket.status_code >= 400:
+        raise RuntimeError(
+            f"The service refused to issue an upload URL "
+            f"(HTTP {ticket.status_code}): {ticket.text[:300]}"
+        )
+    body = ticket.json()
+    upload_url = body.get("upload_url")
+    upload_id = body.get("upload_id")
+    if not upload_url or not upload_id:
+        raise RuntimeError(f"The service did not return an upload ticket: {body}")
+
+    uploaded = httpx.put(
+        upload_url,
+        content=payload,
+        headers={"Content-Type": "text/csv"},
+        timeout=600.0,
+    )
+    if uploaded.status_code >= 400:
+        raise RuntimeError(
+            f"The batch CSV could not be uploaded "
+            f"(HTTP {uploaded.status_code}): {uploaded.text[:300]}"
+        )
+
+    finalized = httpx.post(
+        f"{REVIEW_SERVICE_URL}/jobs/uploads/{upload_id}/finalize",
+        headers=_auth_headers(),
+        json={"options": {"split": True}},
+        timeout=120.0,
+    )
+    if finalized.status_code >= 400:
+        raise RuntimeError(
+            f"The service rejected the uploaded batch "
+            f"(HTTP {finalized.status_code}): {finalized.text[:300]}"
+        )
+    result = finalized.json()
+    job_id = result.get("job_id") or result.get("id")
+    if not job_id:
+        raise RuntimeError(f"The service did not return a job id: {result}")
+    return job_id
+
+
 def submit_batch_run(chunks: list[pd.DataFrame], run_id: str) -> list[dict]:
     """Submit one job per chunk. Returns the job records.
 
@@ -521,22 +576,7 @@ def submit_batch_run(chunks: list[pd.DataFrame], run_id: str) -> list[dict]:
     jobs = []
     for i, chunk in enumerate(chunks, start=1):
         payload = chunk.to_csv(index=False).encode("utf-8")
-        response = httpx.post(
-            f"{REVIEW_SERVICE_URL}/jobs",
-            headers=_auth_headers(),
-            files={"file": (f"{run_id}_batch_{i}.csv", payload, "text/csv")},
-            data={"options": json.dumps({"split": True})},
-            timeout=120.0,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Batch {i} was rejected by the service "
-                f"(HTTP {response.status_code}): {response.text[:300]}"
-            )
-        body = response.json()
-        job_id = body.get("job_id") or body.get("id")
-        if not job_id:
-            raise RuntimeError(f"The service did not return a job id: {body}")
+        job_id = upload_batch_csv(payload, f"{run_id}_batch_{i}.csv")
 
         jobs.append(
             {

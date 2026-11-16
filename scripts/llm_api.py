@@ -48,6 +48,11 @@ TOPIC_LIST = [
 # Gemini is retained so the existing Gemini-annotated corpus stays reproducible.
 PROVIDER = os.environ.get("LLM_PROVIDER", "openrouter").strip().lower()
 
+# The budget for one provider call when the caller does not set one. The
+# pipeline has no gateway in front of it; the deployed service passes a much
+# shorter budget so a split fits inside the API Gateway's integration timeout.
+DEFAULT_SPLIT_TIMEOUT_SECONDS = 60.0
+
 # Will raise error if not found to avoid silent failures.
 # Only the *active* provider's key is required — the previous unconditional
 # GEMINI_API_KEY check took the whole app down when only OpenRouter was configured.
@@ -117,18 +122,26 @@ def build_split_prompt(user_comment: str) -> str:
     """
 
 
-def llm_generate(user_comment: str) -> List[SubComment]:
+def llm_generate(user_comment: str, timeout: float | None = None) -> List[SubComment]:
     """Split a review into sub-comments.
 
-    The signature and return type are unchanged, so
+    ``timeout`` is the total budget for the provider call, retries included.
+    ``None`` uses the default, which is generous: the pipeline runs without a
+    gateway in front of it, while the deployed service passes a budget that
+    fits inside the API Gateway's integration timeout.
+
+    The return type is unchanged, so
     ``scripts/preprocess_data.py``'s ``[user.model_dump() for user in sub_comments]``
     keeps working.
     """
     prompt = build_split_prompt(user_comment)
 
+    if timeout is None:
+        timeout = DEFAULT_SPLIT_TIMEOUT_SECONDS
+
     if PROVIDER == "gemini":
-        return gemini_generate(prompt, api_key=api_key)
-    return openrouter_generate(prompt, api_key=api_key)
+        return gemini_generate(prompt, api_key=api_key, timeout=timeout)
+    return openrouter_generate(prompt, api_key=api_key, timeout=timeout)
 
 
 if __name__ == "__main__":

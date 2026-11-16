@@ -19,6 +19,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 from typing import Any
 
 import httpx
@@ -97,6 +98,17 @@ def _post_openrouter(body: dict[str, Any], api_key: str, timeout: float) -> http
     )
 
 
+#: A retry is only worth starting if this much of the caller's budget is left.
+#: Below it the original error is raised instead — a half-second request that
+#: cannot finish is just another way to fail.
+MIN_RETRY_BUDGET_SECONDS = 2.0
+
+
+def _remaining(deadline: float) -> float:
+    """The seconds left before ``deadline``, floored so a request still starts."""
+    return max(0.1, deadline - time.monotonic())
+
+
 def _raise_for_status(response: httpx.Response) -> None:
     """Raise with the response body attached.
 
@@ -119,6 +131,10 @@ def openrouter_generate(
 ) -> list[Any]:
     """Split a review into sub-comments through OpenRouter.
 
+    ``timeout`` is the **total** budget for the call, the one retry included.
+    Each request gets whatever is left of that budget, so a caller with a
+    deadline is never surprised by a second full-length request.
+
     Tries strict ``json_schema`` structured output first.  Support for
     ``response_format`` is provider-dependent and the MiniMax upstream may not honour
     strict schema enforcement, so a **400 mentioning ``response_format``** falls back
@@ -126,6 +142,7 @@ def openrouter_generate(
     that also fails the error propagates — an unvalidated payload is never returned.
     """
     sub_comment_cls, topic_list = _schema_types()
+    deadline = time.monotonic() + timeout
 
     body: dict[str, Any] = {
         "model": model or DEFAULT_OPENROUTER_MODEL,
@@ -150,14 +167,20 @@ def openrouter_generate(
         body["response_format"] = {"type": "json_object"}
         body["messages"][0]["content"] = prompt + JSON_OBJECT_INSTRUCTION
 
-    response = _post_openrouter(body, api_key, timeout)
+    response = _post_openrouter(body, api_key, _remaining(deadline))
 
-    if response.status_code == 400 and "response_format" in response.text:
+    if (
+        response.status_code == 400
+        and "response_format" in response.text
+        and _remaining(deadline) > MIN_RETRY_BUDGET_SECONDS
+    ):
         # The provider rejected the structured-output request — retry once in plain
-        # JSON mode, naming the shape in the prompt.
+        # JSON mode, naming the shape in the prompt.  The retry only runs when the
+        # caller's budget still leaves room for it; otherwise the original error
+        # is raised.
         body["response_format"] = {"type": "json_object"}
         body["messages"][0]["content"] = prompt + JSON_OBJECT_INSTRUCTION
-        response = _post_openrouter(body, api_key, timeout)
+        response = _post_openrouter(body, api_key, _remaining(deadline))
 
     _raise_for_status(response)
 
@@ -176,11 +199,17 @@ def openrouter_generate(
     return sub_comments
 
 
-def gemini_generate(prompt: str, api_key: str | None = None) -> list[Any]:
+def gemini_generate(
+    prompt: str, api_key: str | None = None, timeout: float | None = None
+) -> list[Any]:
     """Split a review into sub-comments through Gemini.
 
     The original ``google-genai`` call from ``scripts/llm_api.py``, moved verbatim.
     The SDK is imported lazily so the OpenRouter path does not depend on it.
+
+    ``timeout`` bounds the request.  The SDK takes milliseconds; without it the
+    SDK's own default applies, which is far longer than the API Gateway's
+    integration timeout allows.
     """
     from google import genai
     from google.genai import types
@@ -193,7 +222,13 @@ def gemini_generate(prompt: str, api_key: str | None = None) -> list[Any]:
             "GEMINI_API_KEY environment variable not found. Please add it to your .env file."
         )
 
-    client = genai.Client(api_key=api_key)
+    if timeout is not None:
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=int(timeout * 1000)),
+        )
+    else:
+        client = genai.Client(api_key=api_key)
     model = os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
 
     contents = [

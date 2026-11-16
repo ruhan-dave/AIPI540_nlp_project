@@ -1,10 +1,14 @@
 """The ReviewAssist HTTP API.
 
-Two surfaces:
+Three surfaces:
 
 * ``POST /predict`` — one review in, split and labelled sub-comments out.
 * ``POST /jobs``, ``GET /jobs/{job_id}``, ``GET /jobs/{job_id}/result`` — the
   asynchronous batch API the Streamlit frontend drives.
+* ``POST /jobs/uploads`` and ``POST /jobs/uploads/{upload_id}/finalize`` — the
+  presigned upload flow.  A CSV uploaded this way goes straight to the private
+  S3 bucket and never passes through the API Gateway, whose 10 MB payload cap
+  cannot be raised.
 
 ``GET /healthz`` is unauthenticated so the load balancer can poll it: it answers
 ``503`` until the local BERT checkpoint is loaded and ``200`` afterwards.  Every
@@ -15,17 +19,22 @@ The API never puts AWS credentials in a response and never logs review text.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import hmac
 import logging
 import os
+import re
 import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+from botocore.exceptions import ClientError
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -33,13 +42,17 @@ from starlette.concurrency import run_in_threadpool
 from service.batch_io import (
     CsvValidationError,
     build_s3_client,
+    object_size,
     presign_object_get,
+    presign_object_put,
+    read_object_bytes,
     validate_review_csv,
     write_object_bytes,
 )
-from service.inference import ModelRuntime, Splitter
+from service.inference import ModelRuntime, SplitResult, Splitter
 from service.jobs import COMPLETED, JobQueue, JobStore
 from service.schemas import (
+    FinalizeRequest,
     JobCreated,
     JobOptions,
     JobResult,
@@ -47,6 +60,8 @@ from service.schemas import (
     JobStatus,
     PredictRequest,
     PredictResponse,
+    UploadRequest,
+    UploadTicket,
 )
 from service.settings import MIB, ConfigurationError, Settings
 
@@ -57,6 +72,50 @@ UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 #: The default options field, matching `JobOptions`.
 DEFAULT_OPTIONS = '{"split": true}'
+
+#: An upload id is a UUID4 hex.  It is checked against this pattern because it
+#: becomes part of an S3 key: a value like ``../../results/x`` must never be
+#: able to point the finalize route at another object.
+UPLOAD_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+
+#: The executor the deadline-bounded split runs on.
+_split_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="split")
+
+
+class SplitDeadlineExceeded(Exception):
+    """The split did not finish inside the request's deadline."""
+
+
+def _discard_result(future: Any) -> None:
+    """Consume the outcome of an abandoned call so asyncio does not warn."""
+
+    if not future.cancelled():
+        future.exception()
+
+
+async def split_within_deadline(
+    splitter: Splitter,
+    text: str,
+    *,
+    enabled: bool,
+    deadline_seconds: float,
+) -> SplitResult:
+    """Run the split, giving up after ``deadline_seconds``.
+
+    The provider call is **not** cancelled when the deadline passes — it has
+    already been paid for — but the caller stops waiting for it and falls back
+    to the whole review.  That is what keeps the API answering inside the API
+    Gateway's integration timeout instead of letting the gateway answer 504
+    while the service is still working.
+    """
+    loop = asyncio.get_running_loop()
+    call = functools.partial(splitter.split, text, enabled=enabled)
+    future = loop.run_in_executor(_split_executor, call)
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), timeout=deadline_seconds)
+    except asyncio.TimeoutError as exc:
+        future.add_done_callback(_discard_result)
+        raise SplitDeadlineExceeded from exc
 
 
 class RateLimiter:
@@ -247,9 +306,27 @@ def create_app(context: ServiceContext | None = None) -> FastAPI:
             )
 
         try:
-            split = await run_in_threadpool(
-                ctx.splitter.split, payload.text, enabled=payload.split
-            )
+            try:
+                split = await split_within_deadline(
+                    ctx.splitter,
+                    payload.text,
+                    enabled=payload.split,
+                    deadline_seconds=ctx.settings.predict_deadline_seconds,
+                )
+            except SplitDeadlineExceeded:
+                # The provider call is still running and still paid for.  The
+                # caller gets the whole review instead of waiting: the response
+                # has to arrive before the API Gateway's integration timeout.
+                logger.warning(
+                    "predict_deadline_exceeded",
+                    extra={
+                        "provider": ctx.splitter.provider,
+                        "deadline_seconds": ctx.settings.predict_deadline_seconds,
+                    },
+                )
+                split = SplitResult(
+                    texts=[payload.text], fallback=True, provider="none"
+                )
             predictions = await run_in_threadpool(ctx.runtime.predict, split.texts)
         finally:
             ctx.semaphore.release()
@@ -284,7 +361,13 @@ def create_app(context: ServiceContext | None = None) -> FastAPI:
         options: str = Form(default=DEFAULT_OPTIONS),
         token: str = Depends(require_token),
     ) -> JobCreated:
-        """Accept one CSV as one batch job."""
+        """Accept one CSV as one batch job.
+
+        This route carries the CSV through the API, so it is limited to
+        ``MAX_MULTIPART_UPLOAD_BYTES`` — an API Gateway HTTP API caps a request
+        payload at 10 MB and that cap cannot be raised.  A larger CSV goes
+        through the presigned upload flow instead.
+        """
         ctx = request.app.state.context
         settings = ctx.settings
 
@@ -295,11 +378,11 @@ def create_app(context: ServiceContext | None = None) -> FastAPI:
                 422, detail=f"the options field is not valid JSON: {exc}"
             ) from exc
 
-        payload = await read_upload(file, settings.max_upload_bytes)
+        payload = await read_upload(file, settings.max_multipart_upload_bytes)
         try:
             validated = validate_review_csv(
                 payload,
-                max_bytes=settings.max_upload_bytes,
+                max_bytes=settings.max_multipart_upload_bytes,
                 max_rows=settings.max_reviews_per_job,
             )
         except CsvValidationError as exc:
@@ -353,6 +436,174 @@ def create_app(context: ServiceContext | None = None) -> FastAPI:
                 "job_id": job_id,
                 "total_reviews": validated.row_count,
                 "split": job_options.split,
+            },
+        )
+        return JobCreated(
+            job_id=job_id, status=JobStatus.PENDING, total_reviews=validated.row_count
+        )
+
+    @app.post("/jobs/uploads", status_code=201, response_model=UploadTicket)
+    async def create_upload(
+        request: Request,
+        body: UploadRequest | None = None,
+        token: str = Depends(require_token),
+    ) -> UploadTicket:
+        """Issue a short-lived, key-scoped presigned URL for one CSV upload.
+
+        The CSV is uploaded by the caller straight to the private S3 bucket, so
+        it never passes through the API Gateway — whose 10 MB payload cap
+        cannot be raised.  The key is chosen here, never by the caller, and the
+        URL authorises one PUT to that key and nothing else.
+        """
+        ctx = request.app.state.context
+        settings = ctx.settings
+
+        upload_id = uuid.uuid4().hex
+        input_key = f"inputs/{upload_id}/reviews.csv"
+        upload_url = presign_object_put(
+            ctx.s3, settings.job_bucket, input_key, settings.upload_url_ttl_seconds
+        )
+
+        logger.info(
+            "upload_ticket_issued",
+            extra={
+                "upload_id": upload_id,
+                "filename": body.filename if body else None,
+                "expires_in": settings.upload_url_ttl_seconds,
+            },
+        )
+        return UploadTicket(
+            upload_id=upload_id,
+            upload_url=upload_url,
+            input_key=input_key,
+            expires_in=settings.upload_url_ttl_seconds,
+        )
+
+    @app.post("/jobs/uploads/{upload_id}/finalize", status_code=202, response_model=JobCreated)
+    async def finalize_upload(
+        upload_id: str,
+        request: Request,
+        body: FinalizeRequest | None = None,
+        token: str = Depends(require_token),
+    ) -> JobCreated:
+        """Verify an uploaded CSV, turn it into a job and enqueue that job.
+
+        The object is read back from S3 and validated here — its size, its
+        ``content`` column and its row count — so a job only ever enters the
+        queue after its input has been checked.  The upload id becomes the job
+        id, so finalizing the same upload twice is refused instead of
+        creating a second job for the same object.
+        """
+        ctx = request.app.state.context
+        settings = ctx.settings
+
+        if not UPLOAD_ID_PATTERN.fullmatch(upload_id):
+            raise HTTPException(422, detail="the upload id is not valid")
+
+        job_options = body.options if body else JobOptions()
+        input_key = f"inputs/{upload_id}/reviews.csv"
+
+        try:
+            size = object_size(ctx.s3, settings.job_bucket, input_key)
+        except Exception as exc:
+            logger.error(
+                "upload_check_failed",
+                extra={
+                    "upload_id": upload_id,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            raise HTTPException(
+                503, detail="the uploaded file could not be checked"
+            ) from exc
+
+        if size is None:
+            raise HTTPException(
+                409,
+                detail="the upload was not received: there is no object at the upload key",
+            )
+        if size > settings.max_upload_bytes:
+            raise HTTPException(
+                413,
+                detail=(
+                    f"the uploaded file is larger than the "
+                    f"{settings.max_upload_bytes // MIB} MiB limit"
+                ),
+            )
+
+        try:
+            payload = read_object_bytes(ctx.s3, settings.job_bucket, input_key)
+        except Exception as exc:
+            logger.error(
+                "upload_read_failed",
+                extra={
+                    "upload_id": upload_id,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            raise HTTPException(
+                503, detail="the uploaded file could not be read"
+            ) from exc
+
+        try:
+            validated = validate_review_csv(
+                payload,
+                max_bytes=settings.max_upload_bytes,
+                max_rows=settings.max_reviews_per_job,
+            )
+        except CsvValidationError as exc:
+            raise HTTPException(422, detail=str(exc)) from exc
+
+        job_id = upload_id
+        try:
+            ctx.jobs.create(
+                job_id=job_id,
+                input_key=input_key,
+                total_reviews=validated.row_count,
+                options=job_options.model_dump(),
+                ttl_days=settings.job_ttl_days,
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise HTTPException(
+                    409, detail="this upload was already finalized"
+                ) from exc
+            logger.error(
+                "job_record_failed",
+                extra={
+                    "job_id": job_id,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            raise HTTPException(
+                503, detail="the job could not be recorded"
+            ) from exc
+
+        try:
+            ctx.queue.send(
+                job_id=job_id,
+                input_key=input_key,
+                options=job_options.model_dump(),
+            )
+        except Exception as exc:
+            # The job exists but nothing will process it.  Say so instead of
+            # reporting a success that will never complete.
+            logger.error(
+                "job_enqueue_failed",
+                extra={"job_id": job_id, "detail": f"{type(exc).__name__}: {exc}"},
+            )
+            ctx.jobs.fail(job_id=job_id, error="the job could not be queued")
+            raise HTTPException(
+                503, detail="the job could not be queued"
+            ) from exc
+
+        logger.info(
+            "job_accepted",
+            extra={
+                "job_id": job_id,
+                "total_reviews": validated.row_count,
+                "split": job_options.split,
+                "upload": True,
             },
         )
         return JobCreated(

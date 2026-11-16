@@ -3,8 +3,8 @@
 **Plan**: `.claude/plans/aws-deployment.md` § *Planned Change: API Gateway-Generated API Endpoint*
 **Branch**: `feature/aws-deployment` **Status**: COMPLETE (no infrastructure applied — see *Issues encountered*)
 
-**Commit**: _pending_
-**Pull request**: _pending_
+**Commit**: `bad28e0` — *feat: serve the API through an API Gateway HTTP API endpoint*
+**Pull request**: https://github.com/ruhan-dave/AIPI540_nlp_project/pull/3 (base `feature/aws-deployment` ← head `feature/api-gateway-endpoint`)
 
 ## Summary
 

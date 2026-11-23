@@ -108,12 +108,32 @@ resource "aws_sqs_queue" "jobs" {
   tags = local.tags
 }
 
-data "aws_iam_policy_document" "sqs" {
+data "aws_iam_policy_document" "sqs_jobs" {
   statement {
     sid       = "DenyInsecureTransport"
     effect    = "Deny"
     actions   = ["sqs:*"]
-    resources = [aws_sqs_queue.jobs.arn, aws_sqs_queue.dlq.arn]
+    resources = [aws_sqs_queue.jobs.arn]
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "sqs_dlq" {
+  statement {
+    sid       = "DenyInsecureTransport"
+    effect    = "Deny"
+    actions   = ["sqs:*"]
+    resources = [aws_sqs_queue.dlq.arn]
 
     principals {
       type        = "*"
@@ -130,7 +150,12 @@ data "aws_iam_policy_document" "sqs" {
 
 resource "aws_sqs_queue_policy" "jobs" {
   queue_url = aws_sqs_queue.jobs.id
-  policy    = data.aws_iam_policy_document.sqs.json
+  policy    = data.aws_iam_policy_document.sqs_jobs.json
+}
+
+resource "aws_sqs_queue_policy" "dlq" {
+  queue_url = aws_sqs_queue.dlq.id
+  policy    = data.aws_iam_policy_document.sqs_dlq.json
 }
 
 # --- DynamoDB -------------------------------------------------------------
@@ -191,7 +216,6 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "job_data" {
     apply_server_side_encryption_by_default {
       sse_algorithm = "AES256"
     }
-    bucket_key_enabled = true
   }
 }
 
@@ -437,10 +461,9 @@ resource "aws_apigatewayv2_vpc_link" "api" {
 resource "aws_apigatewayv2_integration" "api" {
   api_id = aws_apigatewayv2_api.http.id
 
-  integration_type    = "HTTP_PROXY"
-  integration_method  = "ANY"
-  integration_subtype = "PRIVATE"
-  integration_uri     = aws_lb_listener.http.arn
+  integration_type   = "HTTP_PROXY"
+  integration_method = "ANY"
+  integration_uri    = aws_lb_listener.http.arn
 
   connection_type = "VPC_LINK"
   connection_id   = aws_apigatewayv2_vpc_link.api.id
@@ -476,6 +499,8 @@ resource "aws_apigatewayv2_stage" "default" {
 
   default_route_settings {
     detailed_metrics_enabled = true
+    throttling_burst_limit   = 20
+    throttling_rate_limit    = 10
   }
 }
 

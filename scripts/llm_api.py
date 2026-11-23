@@ -1,9 +1,21 @@
+import json
 import os
+import pathlib
+import sys
 from typing import List
-from google import genai
-from google.genai import types
+
 import pydantic
 from dotenv import load_dotenv
+
+# The repo root has to be importable for the `scripts.*` package imports below.
+# `python scripts/llm_api.py` puts scripts/ on sys.path, not the repo root, and the
+# repo root is what makes `scripts` resolve to *this* package rather than the
+# unrelated `scripts` package installed in site-packages.
+ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from scripts.llm_providers import gemini_generate, openrouter_generate
 
 # Load environment variables from .env file
 load_dotenv()
@@ -15,25 +27,59 @@ class SubComment(pydantic.BaseModel):
     sentiment: float
 
 
-# Initialize the client with API key from environment variable
-# Will raise error if not found to avoid silent failures
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
+# The split vocabulary: 6 labels.
+#
+# This is NOT the BERT head's 8-label vocabulary (models/bert_inference.py:TOPIC_LABELS).
+# The splitter stays on 6 labels because the corpus was annotated with them and BERT
+# was trained on those spans; the BERT head additionally carries two near-empty
+# classes ("overall", "security") that exist in the training data.
+#
+# scripts/eval_model.py:5 (TOPIC_VOCAB) holds the same 6 labels — keep the two in sync.
+TOPIC_LIST = [
+    "price",
+    "quality",
+    "design",
+    "function",
+    "customer service",
+    "other",
+]
+
+# Which provider splits the reviews. "openrouter" (default) or "gemini".
+# Gemini is retained so the existing Gemini-annotated corpus stays reproducible.
+PROVIDER = os.environ.get("LLM_PROVIDER", "openrouter").strip().lower()
+
+# Will raise error if not found to avoid silent failures.
+# Only the *active* provider's key is required — the previous unconditional
+# GEMINI_API_KEY check took the whole app down when only OpenRouter was configured.
+if PROVIDER == "gemini":
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "GEMINI_API_KEY environment variable not found. Please add it to your .env file."
+        )
+elif PROVIDER == "openrouter":
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "OPENROUTER_API_KEY environment variable not found. Please add it to your .env file."
+        )
+else:
     raise ValueError(
-        "GEMINI_API_KEY environment variable not found. Please add it to your .env file."
+        f"Unknown LLM_PROVIDER {PROVIDER!r}. Expected 'openrouter' or 'gemini'."
     )
 
-client = genai.Client(api_key=api_key)
 
-model = "gemini-2.0-flash"
+def build_split_prompt(user_comment: str) -> str:
+    """The split prompt. Unchanged from the original Gemini-only version.
 
-
-def llm_generate(user_comment: str) -> List[SubComment]:
-    prompt = f"""
+    The 6-label vocabulary is interpolated from :data:`TOPIC_LIST` so there is a
+    single source of truth for it.
+    """
+    return f"""
     You are a helpful assistant that can analyze user's comment and split it into a list of sub-comments (size from 1 to 10, 1 means that the sub-comment is the same as the user's comment).
     Each sub-comment should keep the exactly same text in the user's comment. You just hard split the comment into several sub-comments.
     You are not allowed to change the text in the user's comment.
-    For each sub-comment, you should also provide a topic (must in ["price", "quality", "design", "function", "customer service", "other"]) related to the sub-comment that the user is talking about, and a sentiment score (from -1 to 1, -1 means that the sub-comment is negative, 1 means that the sub-comment is positive, 0 means that the sub-comment is neutral) to describe the user's attitude towards the sub-comment with the topic.
+    For each sub-comment, you should also provide a topic (must in {json.dumps(TOPIC_LIST)}) related to the sub-comment that the user is talking about, and a sentiment score (from -1 to 1, -1 means that the sub-comment is negative, 1 means that the sub-comment is positive, 0 means that the sub-comment is neutral) to describe the user's attitude towards the sub-comment with the topic.
     Here is an example for user's comment:
     "I love this product, but the price is too high."
     The example output should be (in JSON format):
@@ -69,31 +115,20 @@ def llm_generate(user_comment: str) -> List[SubComment]:
     "{user_comment}"
     Please output the result:
     """
-    contents = [
-        types.Content(
-            role="user",
-            parts=[
-                types.Part.from_text(text=prompt),
-            ],
-        ),
-    ]
-    generate_content_config = types.GenerateContentConfig(
-        temperature=0.0,
-        top_p=0.95,
-        top_k=64,
-        max_output_tokens=8192,
-        response_mime_type="application/json",
-        response_schema=list[SubComment],
-    )
 
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=generate_content_config,
-    )
-    print(response.text)
 
-    return response.parsed
+def llm_generate(user_comment: str) -> List[SubComment]:
+    """Split a review into sub-comments.
+
+    The signature and return type are unchanged, so
+    ``scripts/preprocess_data.py``'s ``[user.model_dump() for user in sub_comments]``
+    keeps working.
+    """
+    prompt = build_split_prompt(user_comment)
+
+    if PROVIDER == "gemini":
+        return gemini_generate(prompt, api_key=api_key)
+    return openrouter_generate(prompt, api_key=api_key)
 
 
 if __name__ == "__main__":

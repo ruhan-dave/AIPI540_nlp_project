@@ -1,0 +1,51 @@
+{
+  "architecture": "BertMultiTask",
+  "base_model": "bert-base-uncased",
+  "pooling": "pooler",
+  "dropout": 0.1,
+  "num_topics": 8,
+  "topic_labels": [
+    "customer service",
+    "design",
+    "function",
+    "other",
+    "overall",
+    "price",
+    "quality",
+    "security"
+  ],
+  "topic_labels_resolved": true,
+  "sentiment": {
+    "type": "regression",
+    "target_range": [
+      -1.0,
+      1.0
+    ],
+    "source_column": "sub_comments[].sentiment",
+    "note": "The LLM's per-sub-comment sentiment float, NOT the review 'score' column (1-5). See notebooks/bert_modeling.ipynb cell 11."
+  },
+  "source_checkpoint": "model.safetensors (safetensors format) — wrapper-keyed: 199 bert.* tensors + topic_classifier + sentiment_regressor; encoder config is config.json",
+  "forward_return_order": [
+    "topic_logits",
+    "sentiment_score"
+  ],
+  "heads": {
+    "topic_classifier": {
+      "type": "linear",
+      "in_features": 768,
+      "out_features": 8,
+      "output": "logits",
+      "weight_key": "topic_classifier.weight",
+      "bias_key": "topic_classifier.bias"
+    },
+    "sentiment_regressor": {
+      "type": "linear",
+      "in_features": 768,
+      "out_features": 1,
+      "output": "score",
+      "weight_key": "sentiment_regressor.weight",
+      "bias_key": "sentiment_regressor.bias"
+    }
+  },
+  "total_params": 109489161
+}

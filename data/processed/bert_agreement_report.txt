@@ -1,0 +1,57 @@
+==============================================================================
+BERT vs. corpus annotator — agreement report
+==============================================================================
+
+WHAT THIS MEASURES
+-------------------
+This corpus is the corpus BERT was TRAINED on, and its labels were produced
+by the LLM annotator that created the sub-comments (Gemini). The numbers
+below therefore measure AGREEMENT WITH THAT ANNOTATOR on data the model
+has already seen. They are optimistic by construction and are NOT accuracy
+against human ground truth. No such ground truth exists in this repo.
+
+sub-comments annotated: 34559
+
+TOPIC AGREEMENT (BERT argmax vs. corpus topic)
+------------------------------------------------------------------------------
+overall accuracy: 0.8406
+macro-F1 over the 8 labels: 0.5888
+weighted-F1 over the 8 labels: 0.8378
+
+topic                    n  predicted  correct   recall
+customer service      1247        972      871   0.6985
+design                2726       2475     2024   0.7425
+function             18781      19617    17356   0.9241
+other                 7391       8028     5961   0.8065
+overall                  2          6        0   0.0000
+price                 1620       1532     1268   0.7827
+quality               2790       1929     1570   0.5627
+security                 2          0        0   0.0000
+
+Confusion matrix (rows = corpus topic, columns = BERT topic)
+------------------------------------------------------------------------------
+                  custom  design  functi   other  overal   price  qualit  securi
+customer service     871       3     192     156       0      21       4       0
+design                 2    2024     546     134       0       1      19       0
+function              35     320   17356     788       0     141     141       0
+other                 54      85    1024    5961       2      70     195       0
+overall                2       0       0       0       0       0       0       0
+price                  8       9     135     200       0    1268       0       0
+quality                0      34     364     787       4      31    1570       0
+security               0       0       0       2       0       0       0       0
+
+SENTIMENT (regression on the corpus sentiment float)
+------------------------------------------------------------------------------
+n compared:        34559
+RMSE:              0.3802
+MAE:               0.2028
+Pearson r:         0.9089
+corpus sentiment range: [-1.0000, 1.0000]
+
+CALIBRATION
+------------------------------------------------------------------------------
+sentiment clamped to [-1.0, 1.0]: 0.1846 of predictions
+topic confidence < 0.5: 0.0096 of predictions
+the raw (unclamped) values are kept in bert_sentiment_raw so these rates stay observable
+
+==============================================================================

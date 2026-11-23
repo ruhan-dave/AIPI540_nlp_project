@@ -30,7 +30,20 @@ def train_models(data_path):
     df = pd.read_csv(data_path)
     
     # Prepare data for training
-    X = df['content']
+    # Train on the *cleaned* text: the app scores cleaned tokens (lemmatised,
+    # stop-worded) against this model's feature vocabulary. Training on the raw
+    # `content` would put raw tokens ("isn't", "crashing") in the vocabulary and
+    # almost every lookup in calculate_score_lr / calculate_score_nb would miss,
+    # producing a blank, useless highlight.
+    #
+    # Reviews whose text is nothing but stopwords/short tokens clean to an empty
+    # string; to_csv writes that as an empty field and read_csv reads it back as
+    # NaN, which the vectorizers reject. Fill it and drop those rows — they carry
+    # no signal for either vectorizer.
+    df['cleaned_content'] = df['cleaned_content'].fillna('')
+    df = df[df['cleaned_content'].str.strip() != '']
+
+    X = df['cleaned_content']
     y = df['sentiment']
     
     # Create vectorizers

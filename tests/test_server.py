@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -203,13 +205,16 @@ def test_create_job_rejects_more_rows_than_the_job_limit(
 
 
 def test_create_job_rejects_an_upload_over_the_byte_limit(make_client) -> None:
-    with make_client(settings={"max_upload_bytes": 1024}) as client:
+    with make_client(settings={"max_multipart_upload_bytes": 1024}) as client:
         response = submit(client, b"content\n" + b"x" * 2000 + b"\n")
     assert response.status_code == 413
 
 
 def test_the_default_limits_match_the_documented_contract(settings) -> None:
     assert settings.max_upload_bytes == 50 * 1024 * 1024
+    # The multipart route carries the CSV through the API Gateway, whose 10 MB
+    # payload cap cannot be raised.
+    assert settings.max_multipart_upload_bytes == 8 * 1024 * 1024
     assert settings.max_reviews_per_job == 1000
     assert settings.worker_chunk_size == 25
     assert settings.bert_batch_size == 64
@@ -302,3 +307,207 @@ def test_the_completed_result_is_readable_from_storage(
     )
     body = aws_stack.s3.get_object(Bucket=BUCKET, Key=result_key)["Body"].read()
     assert b"hello" in body
+
+
+# --- the presigned upload flow ---------------------------------------------
+#
+# The API Gateway caps a request payload at 10 MB, so a large CSV goes straight
+# to the private bucket through a presigned URL and never through the gateway.
+
+
+def upload_ticket(client: TestClient) -> dict:
+    response = client.post(
+        "/jobs/uploads", json={"filename": "batch.csv"}, headers=auth()
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+def put_upload(aws_stack: ServiceContext, ticket: dict, payload: bytes = VALID_CSV) -> None:
+    """Stand in for the client uploading the CSV to the presigned URL."""
+    aws_stack.s3.put_object(
+        Bucket=BUCKET, Key=ticket["input_key"], Body=payload, ContentType="text/csv"
+    )
+
+
+def test_the_upload_routes_require_a_token(client: TestClient) -> None:
+    assert client.post("/jobs/uploads", json={}).status_code == 401
+    assert (
+        client.post("/jobs/uploads/abc123/finalize", json={}).status_code == 401
+    )
+
+
+def test_the_upload_ticket_is_a_presigned_url_for_a_server_chosen_key(
+    client: TestClient,
+) -> None:
+    ticket = upload_ticket(client)
+    assert ticket["input_key"] == f"inputs/{ticket['upload_id']}/reviews.csv"
+    assert "X-Amz-Signature" in ticket["upload_url"]
+    assert ticket["expires_in"] == 900
+    # The key is the server's, and it is scoped to the input prefix.
+    assert ticket["input_key"].startswith("inputs/")
+
+
+def test_finalize_creates_the_job_from_the_uploaded_object(
+    client: TestClient, aws_stack: ServiceContext
+) -> None:
+    ticket = upload_ticket(client)
+    put_upload(aws_stack, ticket)
+
+    response = client.post(
+        f"/jobs/uploads/{ticket['upload_id']}/finalize",
+        json={"options": {"split": True}},
+        headers=auth(),
+    )
+    assert response.status_code == 202
+    body = response.json()
+    assert body["total_reviews"] == 2
+    assert body["status"] == "PENDING"
+
+    # The upload id is the job id, so the same object cannot become two jobs.
+    assert body["job_id"] == ticket["upload_id"]
+
+    record = aws_stack.jobs.get(body["job_id"])
+    assert record["input_key"] == ticket["input_key"]
+    assert record["total_reviews"] == 2
+
+    messages = aws_stack.queue.receive(wait_seconds=0)
+    assert len(messages) == 1
+    assert json.loads(messages[0]["Body"])["job_id"] == body["job_id"]
+
+
+def test_finalize_without_an_uploaded_object_is_refused(client: TestClient) -> None:
+    ticket = upload_ticket(client)
+    response = client.post(
+        f"/jobs/uploads/{ticket['upload_id']}/finalize", json={}, headers=auth()
+    )
+    assert response.status_code == 409
+    assert "not received" in response.json()["detail"]
+
+
+def test_finalize_rejects_a_csv_without_a_content_column(
+    client: TestClient, aws_stack: ServiceContext
+) -> None:
+    ticket = upload_ticket(client)
+    put_upload(aws_stack, ticket, b"text,score\nhello,5\n")
+    response = client.post(
+        f"/jobs/uploads/{ticket['upload_id']}/finalize", json={}, headers=auth()
+    )
+    assert response.status_code == 422
+    assert "content" in response.json()["detail"]
+
+
+def test_finalize_rejects_an_upload_over_the_byte_limit(
+    make_client, aws_stack: ServiceContext
+) -> None:
+    with make_client(settings={"max_upload_bytes": 1024}) as client:
+        ticket = upload_ticket(client)
+        put_upload(aws_stack, ticket, b"content\n" + b"x" * 2000 + b"\n")
+        response = client.post(
+            f"/jobs/uploads/{ticket['upload_id']}/finalize", json={}, headers=auth()
+        )
+    assert response.status_code == 413
+
+
+def test_finalize_rejects_an_upload_id_that_is_not_one(
+    client: TestClient,
+) -> None:
+    """The upload id becomes part of an S3 key, so it is not free text."""
+    response = client.post(
+        "/jobs/uploads/not-a-uuid/finalize", json={}, headers=auth()
+    )
+    assert response.status_code == 422
+    assert "upload id" in response.json()["detail"]
+
+
+def test_finalize_refuses_a_traversal_attempt(client: TestClient) -> None:
+    """A crafted upload id must not be able to point at another object."""
+    response = client.post(
+        "/jobs/uploads/..%2F..%2Fresults%2Fx/finalize", json={}, headers=auth()
+    )
+    assert response.status_code in (404, 422)
+
+
+def test_finalizing_the_same_upload_twice_is_refused(
+    client: TestClient, aws_stack: ServiceContext
+) -> None:
+    ticket = upload_ticket(client)
+    put_upload(aws_stack, ticket)
+    first = client.post(
+        f"/jobs/uploads/{ticket['upload_id']}/finalize", json={}, headers=auth()
+    )
+    assert first.status_code == 202
+    second = client.post(
+        f"/jobs/uploads/{ticket['upload_id']}/finalize", json={}, headers=auth()
+    )
+    assert second.status_code == 409
+    assert "already finalized" in second.json()["detail"]
+
+
+def test_a_failed_enqueue_during_finalize_marks_the_job_failed(
+    client: TestClient, aws_stack: ServiceContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(**_kwargs):
+        raise RuntimeError("sqs is down")
+
+    monkeypatch.setattr(aws_stack.queue, "send", boom)
+    ticket = upload_ticket(client)
+    put_upload(aws_stack, ticket)
+    response = client.post(
+        f"/jobs/uploads/{ticket['upload_id']}/finalize", json={}, headers=auth()
+    )
+    assert response.status_code == 503
+    assert aws_stack.jobs.get(ticket["upload_id"])["status"] == FAILED
+
+
+# --- the prediction deadline -----------------------------------------------
+
+
+def test_predict_falls_back_to_the_whole_review_when_the_split_overruns_the_deadline(
+    make_client, aws_stack: ServiceContext
+) -> None:
+    """The gateway answers 504 after 30 seconds; the API must answer first.
+
+    The provider call is abandoned, not cancelled — it is already paid for —
+    but the caller gets the whole review instead of waiting for it.
+    """
+    import time as time_module
+
+    def slow_generate(text: str, timeout=None):
+        time_module.sleep(0.5)
+        return [SimpleNamespace(sub_comment=text, topic="other", sentiment=0.1)]
+
+    with make_client(
+        settings={"predict_deadline_seconds": 0.05},
+        splitter=Splitter(aws_stack.settings, generate=slow_generate),
+    ) as client:
+        response = client.post(
+            "/predict", json={"text": "great app", "split": True}, headers=auth()
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "none"
+    assert body["split_fallback"] is True
+    assert len(body["sub_comments"]) == 1
+    assert body["sub_comments"][0]["text"] == "great app"
+
+
+def test_the_splitter_passes_its_budget_to_the_provider(
+    make_client, aws_stack: ServiceContext
+) -> None:
+    """The provider call is given the configured budget, not an open-ended one."""
+    seen: dict[str, object] = {}
+
+    def recording_generate(text: str, timeout=None):
+        seen["timeout"] = timeout
+        return [SimpleNamespace(sub_comment=text, topic="other", sentiment=0.1)]
+
+    settings = dataclasses.replace(aws_stack.settings, predict_timeout_seconds=7)
+    with make_client(
+        settings={"predict_timeout_seconds": 7},
+        splitter=Splitter(settings, generate=recording_generate),
+    ) as client:
+        client.post("/predict", json={"text": "great app"}, headers=auth())
+
+    assert seen["timeout"] == 7

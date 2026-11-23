@@ -9,11 +9,13 @@
 #   * one private S3 bucket for job inputs and results
 #   * two Secrets Manager secrets (metadata only — the values are seeded by hand)
 #   * one CloudWatch log group
-#   * an ALB with an HTTPS listener and an ACM certificate
+#   * an internal ALB with a private HTTP listener
+#   * an API Gateway HTTP API whose generated execute-api endpoint is the only
+#     public surface, reaching the ALB through a VPC link
 #   * the IAM roles and security groups those need
 #
 # What it deliberately does NOT create: a VPC, subnets, a NAT gateway, VPC
-# endpoints, API Gateway, WAF, ElastiCache, autoscaling or Container Insights.
+# endpoints, WAF, ElastiCache, autoscaling or Container Insights.
 # The tasks get public IPs in the existing public subnets instead.
 
 data "aws_caller_identity" "current" {}
@@ -35,6 +37,11 @@ locals {
   # of band, so they never enter the Terraform state.
   api_secret_arn      = coalesce(var.api_secret_arn, aws_secretsmanager_secret.api.arn)
   provider_secret_arn = coalesce(var.provider_secret_arn, aws_secretsmanager_secret.provider.arn)
+
+  # An empty subnet list means "use the public subnets": the load balancer is
+  # internal and the VPC link only has to be routable to it.
+  alb_subnet_ids      = length(var.alb_subnet_ids) > 0 ? var.alb_subnet_ids : var.public_subnet_ids
+  vpc_link_subnet_ids = length(var.vpc_link_subnet_ids) > 0 ? var.vpc_link_subnet_ids : var.public_subnet_ids
 
   tags = merge(var.tags, { Name = var.name_prefix })
 }
@@ -101,12 +108,32 @@ resource "aws_sqs_queue" "jobs" {
   tags = local.tags
 }
 
-data "aws_iam_policy_document" "sqs" {
+data "aws_iam_policy_document" "sqs_jobs" {
   statement {
     sid       = "DenyInsecureTransport"
     effect    = "Deny"
     actions   = ["sqs:*"]
-    resources = [aws_sqs_queue.jobs.arn, aws_sqs_queue.dlq.arn]
+    resources = [aws_sqs_queue.jobs.arn]
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "sqs_dlq" {
+  statement {
+    sid       = "DenyInsecureTransport"
+    effect    = "Deny"
+    actions   = ["sqs:*"]
+    resources = [aws_sqs_queue.dlq.arn]
 
     principals {
       type        = "*"
@@ -123,7 +150,12 @@ data "aws_iam_policy_document" "sqs" {
 
 resource "aws_sqs_queue_policy" "jobs" {
   queue_url = aws_sqs_queue.jobs.id
-  policy    = data.aws_iam_policy_document.sqs.json
+  policy    = data.aws_iam_policy_document.sqs_jobs.json
+}
+
+resource "aws_sqs_queue_policy" "dlq" {
+  queue_url = aws_sqs_queue.dlq.id
+  policy    = data.aws_iam_policy_document.sqs_dlq.json
 }
 
 # --- DynamoDB -------------------------------------------------------------
@@ -184,7 +216,6 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "job_data" {
     apply_server_side_encryption_by_default {
       sse_algorithm = "AES256"
     }
-    bucket_key_enabled = true
   }
 }
 
@@ -260,17 +291,33 @@ resource "aws_secretsmanager_secret" "provider" {
 
 # --- Security groups ------------------------------------------------------
 
+resource "aws_security_group" "vpc_link" {
+  name        = "${var.name_prefix}-vpclink"
+  description = "The API Gateway VPC link. It reaches the internal load balancer over private HTTP."
+  vpc_id      = var.vpc_id
+
+  egress {
+    description = "HTTP to the internal load balancer."
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = local.tags
+}
+
 resource "aws_security_group" "alb" {
   name        = "${var.name_prefix}-alb"
-  description = "Public HTTPS ingress for the ReviewAssist API."
+  description = "Internal HTTP ingress for the ReviewAssist API. Reachable only from the API Gateway VPC link."
   vpc_id      = var.vpc_id
 
   ingress {
-    description = "HTTPS from the internet (Railway calls the API from outside the VPC)."
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "HTTP from the API Gateway VPC link only."
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.vpc_link.id]
   }
 
   egress {
@@ -329,9 +376,12 @@ resource "aws_security_group" "worker" {
 resource "aws_lb" "api" {
   name               = substr("${var.name_prefix}-api", 0, 32)
   load_balancer_type = "application"
-  internal           = false
 
-  subnets         = var.public_subnet_ids
+  # Internal: the load balancer resolves only inside the VPC and has no public
+  # address.  The API Gateway's VPC link is the only thing that can reach it.
+  internal = true
+
+  subnets         = local.alb_subnet_ids
   security_groups = [aws_security_group.alb.id]
 
   idle_timeout               = 120
@@ -368,16 +418,89 @@ resource "aws_lb_target_group" "api" {
   tags = local.tags
 }
 
-resource "aws_lb_listener" "https" {
+resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.api.arn
-  port              = 443
-  protocol          = "HTTPS"
-  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn   = var.acm_certificate_arn
+  port              = 80
+  protocol          = "HTTP"
 
+  # The listener is private: the VPC link is the only client, and the hop
+  # never leaves the VPC.  There is deliberately no HTTPS listener here — the
+  # public TLS termination is the API Gateway's generated endpoint.
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.api.arn
+  }
+}
+
+# --- API Gateway ----------------------------------------------------------
+#
+# The HTTP API's generated execute-api endpoint is the only public surface of
+# this stack.  It reaches the internal load balancer through a VPC link, so the
+# path is: Railway -> HTTPS -> API Gateway -> private HTTP -> ALB -> the task.
+
+resource "aws_apigatewayv2_api" "http" {
+  name          = "${var.name_prefix}-http"
+  protocol_type = "HTTP"
+
+  # The generated execute-api endpoint comes with AWS's own certificate, so no
+  # domain and no ACM certificate have to be bought or renewed.
+  disable_execute_api_endpoint = false
+
+  tags = local.tags
+}
+
+resource "aws_apigatewayv2_vpc_link" "api" {
+  name = "${var.name_prefix}-vpclink"
+
+  security_group_ids = length(var.vpc_link_security_group_ids) > 0 ? var.vpc_link_security_group_ids : [aws_security_group.vpc_link.id]
+  subnet_ids         = local.vpc_link_subnet_ids
+
+  tags = local.tags
+}
+
+resource "aws_apigatewayv2_integration" "api" {
+  api_id = aws_apigatewayv2_api.http.id
+
+  integration_type   = "HTTP_PROXY"
+  integration_method = "ANY"
+  integration_uri    = aws_lb_listener.http.arn
+
+  connection_type = "VPC_LINK"
+  connection_id   = aws_apigatewayv2_vpc_link.api.id
+
+  payload_format_version = "1.0"
+
+  # An HTTP API's integration timeout cannot exceed 30 seconds.  It is set a
+  # second under the cap so the response still reaches the client instead of
+  # the gateway answering 504 on its own.
+  timeout_milliseconds = var.http_api_integration_timeout_ms
+}
+
+# The root route and the greedy one together cover every path the frontend
+# calls: `/healthz`, `/predict`, `/jobs` and `/jobs/{id}/result`.
+resource "aws_apigatewayv2_route" "root" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "ANY /"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
+resource "aws_apigatewayv2_route" "proxy" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "ANY /{proxy+}"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
+# The `$default` stage has the base path mapping `/`, so no stage prefix is
+# added to the path on its way to FastAPI.
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.http.id
+  name        = "$default"
+  auto_deploy = true
+
+  default_route_settings {
+    detailed_metrics_enabled = true
+    throttling_burst_limit   = 20
+    throttling_rate_limit    = 10
   }
 }
 
@@ -566,6 +689,11 @@ locals {
     { name = "MODEL_DIR", value = "/app/models/saved_bert_model" },
     { name = "MODEL_DEVICE", value = "cpu" },
     { name = "MAX_UPLOAD_BYTES", value = tostring(var.max_upload_bytes) },
+    { name = "MAX_MULTIPART_UPLOAD_BYTES", value = tostring(var.max_multipart_upload_bytes) },
+    { name = "UPLOAD_URL_TTL_SECONDS", value = tostring(var.upload_url_ttl_seconds) },
+    { name = "PREDICT_TIMEOUT_SECONDS", value = tostring(var.predict_timeout_seconds) },
+    { name = "PREDICT_DEADLINE_SECONDS", value = tostring(var.predict_deadline_seconds) },
+    { name = "WORKER_SPLIT_TIMEOUT_SECONDS", value = tostring(var.worker_split_timeout_seconds) },
     { name = "MAX_REVIEWS_PER_JOB", value = tostring(var.max_reviews_per_job) },
     { name = "WORKER_CHUNK_SIZE", value = tostring(var.worker_chunk_size) },
     { name = "BERT_BATCH_SIZE", value = tostring(var.bert_batch_size) },
@@ -695,7 +823,7 @@ resource "aws_ecs_service" "api" {
     container_port   = 8000
   }
 
-  depends_on = [aws_lb_listener.https]
+  depends_on = [aws_lb_listener.http]
 
   tags = local.tags
 }

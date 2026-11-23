@@ -15,6 +15,7 @@ shipped to CloudWatch.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 from dataclasses import dataclass
@@ -176,11 +177,20 @@ class Splitter:
     the split fell back.  Nothing is silently swallowed.
     """
 
-    def __init__(self, settings: Settings, *, generate: Any = None) -> None:
+    def __init__(
+        self, settings: Settings, *, generate: Any = None, timeout: float | None = None
+    ) -> None:
         self._settings = settings
         self._generate = generate
         self._error: str | None = None
         self._lock = threading.Lock()
+        # The budget for one provider call.  The API keeps the short budget
+        # that fits inside the API Gateway's integration timeout; the worker
+        # has no gateway in front of it and can afford to wait longer for one
+        # review's split.
+        self._timeout = (
+            settings.predict_timeout_seconds if timeout is None else float(timeout)
+        )
 
     @property
     def provider(self) -> str:
@@ -190,6 +200,11 @@ class Splitter:
     @property
     def available(self) -> bool:
         return self._load() is not None
+
+    @property
+    def timeout(self) -> float:
+        """The budget for one provider call, in seconds."""
+        return self._timeout
 
     def _load(self):
         if self._generate is not None:
@@ -214,6 +229,22 @@ class Splitter:
             self._generate = llm_generate
             return self._generate
 
+    @staticmethod
+    def _accepts_timeout(generate: Any) -> bool:
+        """Whether ``generate`` takes a ``timeout`` argument.
+
+        The provider call is given a budget so it cannot outlive the request
+        that started it.  A callable that does not accept one — an injected
+        test double, say — is simply called without it.
+        """
+        try:
+            parameters = inspect.signature(generate).parameters
+        except (TypeError, ValueError):  # pragma: no cover - builtins only
+            return False
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            return True
+        return "timeout" in parameters
+
     def split(self, text: str, *, enabled: bool = True) -> SplitResult:
         """Split ``text`` into sub-comment texts.
 
@@ -228,8 +259,12 @@ class Splitter:
         if generate is None:
             return SplitResult(texts=[text], fallback=True, provider="none")
 
+        timeout = self._timeout
         try:
-            sub_comments = generate(text)
+            if self._accepts_timeout(generate):
+                sub_comments = generate(text, timeout=timeout)
+            else:
+                sub_comments = generate(text)
         except Exception as exc:
             logger.warning(
                 "split_failed",

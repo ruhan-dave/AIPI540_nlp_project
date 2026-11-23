@@ -1,0 +1,11 @@
+# Development and test dependencies for the service.
+#
+# The runtime dependencies of the backend image live in service/requirements.txt;
+# the frontend's live in frontend-requirements.txt. This file is for the test
+# suite only — it is not installed into any image.
+
+pytest==9.2.0
+moto[dynamodb,s3,sqs]==5.2.5
+fastapi==0.162.6
+httpx==0.28.1
+boto3==1.44.2

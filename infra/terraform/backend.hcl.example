@@ -1,0 +1,8 @@
+# Copy this file to `backend.hcl` and fill in the values from the bootstrap
+# root's `application_backend_config` output. `backend.hcl` is gitignored.
+#
+#   cp backend.hcl.example backend.hcl
+#
+bucket = "reviewassist-tfstate-XXXXXXXX"
+key    = "application/terraform.tfstate"
+region = "us-east-1"

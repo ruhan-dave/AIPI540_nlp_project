@@ -1,0 +1,21 @@
+# Dependencies of the ReviewAssist backend image (the API and the worker).
+#
+# Torch is NOT listed here: it is installed from the CPU-only index in the
+# Dockerfile, so the image never carries a CUDA build.
+#
+# The versions match the repository's root requirements.txt where a package
+# appears in both.
+
+boto3==1.44.2
+botocore==1.44.2
+fastapi==0.162.6
+uvicorn[standard]==0.54.0
+python-multipart==0.0.33
+pydantic==2.10.6
+httpx==0.28.1
+python-dotenv==1.0.1
+numpy==1.26.4
+pandas==2.2.3
+transformers==4.49.0
+safetensors==0.5.3
+google-genai==1.7.0

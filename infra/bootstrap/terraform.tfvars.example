@@ -1,0 +1,19 @@
+# Copy this file to `terraform.tfvars` and adjust it. `terraform.tfvars` is
+# gitignored; only this example is tracked.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# Nothing secret belongs in this file. The API token and the LLM provider key
+# are seeded into AWS Secrets Manager out of band, after the first apply.
+
+region      = "us-east-1"
+name_prefix = "reviewassist"
+
+# Restrict state access to the deployment role. Leave it empty to keep the
+# default (every principal in the account that IAM authorizes).
+# allowed_principals = ["arn:aws:iam::123456789012:role/TerraformDeploy"]
+
+tags = {
+  Project = "reviewassist"
+  Managed = "terraform"
+}
